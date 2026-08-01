@@ -14,7 +14,7 @@
       "project_skill_directories": [".agents/skills"]
     },
     "cursor": {
-      "binaries": ["agent", "cursor"],
+      "binaries": ["cursor-agent", "agent", "cursor"],
       "global_skill_directories": [".agents/skills"],
       "legacy_global_skill_directories": [".cursor/skills", ".cursor/skills-cursor"],
       "project_skill_directories": [".agents/skills"]

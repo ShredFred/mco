@@ -46,6 +46,11 @@ Rules:
 npm i -g @tt-a1i/mco
 ```
 
+The npm launcher requires Python 3.10 or newer. It checks versioned Python
+commands before the system `python3` (important on macOS, where
+`/usr/bin/python3` may still be 3.9), then tries an installed `uv` runtime.
+Set `MCO_PYTHON` to an explicit interpreter path when needed.
+
 Then sync the Skill explicitly:
 
 ```bash

@@ -15,7 +15,7 @@ MCO ships ten built-in provider adapters. A provider must still be installed and
 | Hermes | `hermes` | `hermes` | Oneshot execution bypasses approvals |
 | Pi | `pi` | `pi` | Explicit tool allowlists |
 | Grok Build | `grok` | `grok` | Plan, accept-edits, and bypass modes |
-| Cursor CLI | `cursor` | `cursor` or `agent` | Ask, sandboxed-agent, and unsandboxed-agent profiles |
+| Cursor CLI | `cursor` | `cursor-agent` or `agent` | Ask, sandboxed-agent, and unsandboxed-agent profiles |
 
 ## Unified execution modes
 

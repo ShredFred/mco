@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from runtime.adapters.cursor import CursorAdapter
 from runtime.adapters.grok import GrokAdapter
@@ -45,14 +46,35 @@ class GrokAdapterTests(unittest.TestCase):
 
 class CursorAdapterTests(unittest.TestCase):
     def test_auth_check_uses_official_status_command(self) -> None:
-        self.assertEqual(CursorAdapter()._auth_check_command("agent"), ["agent", "status"])
+        self.assertEqual(
+            CursorAdapter()._auth_check_command("cursor-agent"),
+            ["cursor-agent", "status"],
+        )
+
+    @patch("runtime.adapters.cursor.shutil.which")
+    def test_resolves_current_cursor_agent_binary_before_legacy_alias(self, which) -> None:
+        which.side_effect = lambda name: "/bin/cursor-agent" if name == "cursor-agent" else "/bin/agent"
+        self.assertEqual(CursorAdapter()._resolve_binary(), "/bin/cursor-agent")
+
+    @patch("runtime.adapters.cursor.shutil.which")
+    def test_resolves_legacy_agent_alias_as_fallback(self, which) -> None:
+        which.side_effect = lambda name: None if name == "cursor-agent" else "/bin/agent"
+        self.assertEqual(CursorAdapter()._resolve_binary(), "/bin/agent")
+
+    @patch("runtime.adapters.cursor.shutil.which")
+    def test_command_and_record_use_legacy_agent_alias_as_fallback(self, which) -> None:
+        which.side_effect = lambda name: None if name == "cursor-agent" else "/bin/agent"
+        adapter = CursorAdapter()
+        self.assertEqual(adapter._build_command(_task())[0], "agent")
+        self.assertEqual(adapter._build_command_for_record()[0], "agent")
 
     def test_default_command_is_headless_read_only_ask_mode(self) -> None:
         command = CursorAdapter()._build_command(_task())
-        self.assertEqual(command[:3], ["agent", "-p", "Review this repository."])
+        self.assertEqual(command[:3], ["cursor-agent", "-p", "Review this repository."])
         self.assertIn("--mode", command)
         self.assertEqual(command[command.index("--mode") + 1], "ask")
         self.assertNotIn("--force", command)
+        self.assertEqual(command[command.index("--sandbox") + 1], "enabled")
 
     def test_command_applies_model_and_mode_override(self) -> None:
         command = CursorAdapter()._build_command(

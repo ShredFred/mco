@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from typing import Any, List
 
 from ..contracts import CapabilitySet, TaskInput
@@ -10,7 +11,7 @@ class CursorAdapter(ShimAdapterBase):
     def __init__(self) -> None:
         super().__init__(
             provider_id="cursor",
-            binary_name="agent",
+            binary_name="cursor-agent",
             capability_set=CapabilitySet(
                 tiers=["C0", "C1", "C2", "C3"],
                 supports_native_async=False,
@@ -22,6 +23,16 @@ class CursorAdapter(ShimAdapterBase):
             ),
         )
 
+    def _resolve_binary(self) -> str | None:
+        return shutil.which("cursor-agent") or shutil.which("agent")
+
+    def _command_binary(self) -> str:
+        if shutil.which("cursor-agent"):
+            return "cursor-agent"
+        if shutil.which("agent"):
+            return "agent"
+        return self.binary_name
+
     def _auth_check_command(self, binary: str) -> List[str]:
         return [binary, "status"]
 
@@ -32,7 +43,7 @@ class CursorAdapter(ShimAdapterBase):
         return ["model"]
 
     def _build_command(self, input_task: TaskInput) -> List[str]:
-        command = ["agent", "-p", input_task.prompt, "--output-format", "text"]
+        command = [self._command_binary(), "-p", input_task.prompt, "--output-format", "text"]
         permissions = input_task.metadata.get("provider_permissions", {})
         mode = permissions.get("mode") if isinstance(permissions, dict) else None
         resolved_mode = str(mode).strip() if isinstance(mode, str) and mode.strip() else "ask"
@@ -46,17 +57,17 @@ class CursorAdapter(ShimAdapterBase):
         if force == "true":
             command.append("--force")
         sandbox = permissions.get("sandbox") if isinstance(permissions, dict) else None
-        if sandbox not in (None, "", "enabled", "disabled"):
+        resolved_sandbox = str(sandbox).strip() if isinstance(sandbox, str) and sandbox.strip() else "enabled"
+        if resolved_sandbox not in ("enabled", "disabled"):
             raise ValueError("unsupported Cursor sandbox value: {}".format(sandbox))
-        if isinstance(sandbox, str) and sandbox:
-            command.extend(["--sandbox", sandbox])
+        command.extend(["--sandbox", resolved_sandbox])
         model = input_task.metadata.get("model")
         if isinstance(model, str) and model.strip():
             command.extend(["--model", model.strip()])
         return command
 
     def _build_command_for_record(self) -> List[str]:
-        return ["agent", "-p", "<prompt>", "--output-format", "text", "--mode", "ask"]
+        return [self._command_binary(), "-p", "<prompt>", "--output-format", "text", "--mode", "ask"]
 
     def _is_success(self, return_code: int, stdout_text: str, stderr_text: str) -> bool:
         return return_code == 0 and bool(stdout_text.strip())

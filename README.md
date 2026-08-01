@@ -85,7 +85,7 @@ For explicit review coordination, `--perspectives-json` adds a Provider-specific
 | Hermes | `hermes` | `hermes` |
 | Pi | `pi` | `pi` |
 | [Grok Build](https://docs.x.ai/build/overview) | `grok` | `grok` |
-| [Cursor CLI](https://cursor.com/docs/cli/overview) | `cursor` / `agent` | `cursor` |
+| [Cursor CLI](https://cursor.com/docs/cli/overview) | `cursor-agent` / `agent` | `cursor` |
 
 Each provider CLI remains responsible for its own installation, authentication, model access, and native sandbox behavior.
 
