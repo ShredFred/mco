@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import json
+import logging
 import queue
 import shutil
 import tempfile
@@ -24,6 +25,8 @@ COMPLETE_EXIT_CODE = 0
 PARTIAL_EXIT_CODE = 1
 FAILED_EXIT_CODE = 2
 _EVENT_CALLBACK_LOCK = threading.RLock()
+# Warn at most once per process; a failing consumer usually fails on every event.
+_EVENT_CALLBACK_WARNED: set[bool] = set()
 
 
 def _run_adapter_with_deadline(
@@ -83,8 +86,14 @@ def _notify(event_callback: Optional[Callable[[dict[str, object]], None]], event
     try:
         with _EVENT_CALLBACK_LOCK:
             event_callback(event)
-    except Exception:
-        pass
+    except Exception as exc:
+        # A broken consumer must never take a provider run down, but silence
+        # here can cost a whole answer: a console encoding error swallowed
+        # every delta while the run still reported success. Warn once so a
+        # dropped event is diagnosable instead of invisible.
+        if not _EVENT_CALLBACK_WARNED:
+            _EVENT_CALLBACK_WARNED.add(True)
+            logging.warning("event callback failed, streamed output was dropped: %s", exc)
 
 
 @dataclass(frozen=True)

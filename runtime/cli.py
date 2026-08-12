@@ -1942,6 +1942,27 @@ def _handle_session(args: argparse.Namespace) -> int:
     return 2
 
 
+def _write_provider_text(text: str, stream: Any = None) -> None:
+    """Write raw provider text without letting the console encoding drop it.
+
+    Provider answers routinely contain characters a legacy console codepage
+    cannot represent (arrows, dashes, box drawing). A plain print then raises
+    UnicodeEncodeError, and because the runtime's event dispatch protects a run
+    from a misbehaving callback by swallowing exceptions, the whole write
+    vanished silently: exit code 0, empty stdout, and the answer visible only
+    through --json, which escapes to ASCII.
+
+    Degrade per character instead of losing the write.
+    """
+    target = stream if stream is not None else sys.stdout
+    try:
+        target.write(text)
+    except UnicodeEncodeError:
+        encoding = getattr(target, "encoding", None) or "ascii"
+        target.write(text.encode(encoding, "backslashreplace").decode(encoding, "replace"))
+    target.flush()
+
+
 def main(argv: List[str] | None = None) -> int:
     _raw_argv = argv if argv is not None else sys.argv[1:]
     _wants_json = "--json" in _raw_argv
@@ -2392,16 +2413,18 @@ def main(argv: List[str] | None = None) -> int:
                         if event.get("type") == "invocation_finished":
                             diagnostic = event.get("stderr", "")
                             if isinstance(diagnostic, str) and diagnostic:
-                                print(diagnostic, file=sys.stderr, end="" if diagnostic.endswith("\n") else "\n", flush=True)
+                                _write_provider_text(
+                                    diagnostic if diagnostic.endswith("\n") else diagnostic + "\n",
+                                    sys.stderr,
+                                )
                             if event.get("status") != "success" and event.get("error"):
-                                print(
-                                    "[mco] {} {}: {}".format(
+                                _write_provider_text(
+                                    "[mco] {} {}: {}\n".format(
                                         event.get("invocation_id", "invocation"),
                                         event.get("status", "failed"),
                                         event.get("error"),
                                     ),
-                                    file=sys.stderr,
-                                    flush=True,
+                                    sys.stderr,
                                 )
                             return
                         if event.get("type") != "output_delta":
@@ -2412,9 +2435,11 @@ def main(argv: List[str] | None = None) -> int:
                             return
                         if len(invocations) > 1 and active_source[0] != source:
                             prefix = "" if active_source[0] is None else "\n"
-                            print("{}── {} ──\n".format(prefix, source_labels.get(source, source)), end="", flush=True)
+                            _write_provider_text(
+                                "{}── {} ──\n".format(prefix, source_labels.get(source, source)),
+                            )
                             active_source[0] = source
-                        print(delta, end="", flush=True)
+                        _write_provider_text(delta)
 
                 event_callback = _emit_text
         try:

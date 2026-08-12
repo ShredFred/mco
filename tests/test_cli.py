@@ -12,6 +12,7 @@ from runtime.cli import (
     _parse_provider_timeouts,
     _parse_providers,
     _StreamSafeParser,
+    _write_provider_text,
     build_parser,
     _resolve_config,
     main,
@@ -302,6 +303,42 @@ class CliTests(unittest.TestCase):
             exit_code = main(["version"])
         self.assertEqual(exit_code, 0)
         self.assertEqual(stdout_buf.getvalue().strip(), __version__)
+
+
+class ProviderTextOutputTests(unittest.TestCase):
+    """A legacy console codepage must not silently discard a provider answer."""
+
+    @staticmethod
+    def _legacy_console() -> tuple[io.TextIOWrapper, io.BytesIO]:
+        raw = io.BytesIO()
+        # cp1252 is a common default Windows console codepage.
+        return io.TextIOWrapper(raw, encoding="cp1252", errors="strict", newline=""), raw
+
+    def test_answer_survives_a_console_that_cannot_encode_it(self) -> None:
+        console, raw = self._legacy_console()
+        _write_provider_text("Finding: latency -> → fixed\n", console)
+        console.flush()
+
+        rendered = raw.getvalue().decode("cp1252")
+        self.assertIn("Finding: latency -> ", rendered)
+        self.assertIn("fixed", rendered)
+
+    def test_encodable_text_is_written_verbatim(self) -> None:
+        console, raw = self._legacy_console()
+        _write_provider_text("plain ascii answer\n", console)
+        console.flush()
+
+        self.assertEqual(raw.getvalue().decode("cp1252"), "plain ascii answer\n")
+
+    def test_a_single_unencodable_character_does_not_drop_the_whole_write(self) -> None:
+        # The reported failure: one arrow in a long answer left stdout empty
+        # while the run still exited 0 and --json showed the full text.
+        answer = "".join("line {} → ok\n".format(index) for index in range(20))
+        console, raw = self._legacy_console()
+        _write_provider_text(answer, console)
+        console.flush()
+
+        self.assertEqual(raw.getvalue().decode("cp1252").count("ok"), 20)
 
 
 if __name__ == "__main__":
