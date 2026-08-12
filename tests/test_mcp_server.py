@@ -123,6 +123,39 @@ class McpPolicyTests(unittest.TestCase):
         self.assertEqual(kwargs["hard_timeout_seconds"], 180)
         self.assertEqual(kwargs["provider_timeouts"], {})
 
+    def test_review_uses_a_model_pinned_in_config(self) -> None:
+        self._write_global_config({"provider_models": {"pi": {"model": "pi-pinned"}}})
+        with tempfile.TemporaryDirectory() as repo, patch(
+            "runtime.invocation_runtime.run_invocation_workflow", return_value=self._workflow_result,
+        ) as workflow:
+            _sync_review(repo, "review", "pi")
+
+        self.assertEqual(
+            [item.model for item in workflow.call_args.kwargs["invocations"]], ["pi-pinned"],
+        )
+
+    def test_a_bare_string_is_accepted_as_the_documented_pin_shorthand(self) -> None:
+        # The CLI accepts "pi": "pi-pinned"; the MCP path must not ignore it.
+        self._write_global_config({"provider_models": {"pi": "pi-pinned"}})
+        with tempfile.TemporaryDirectory() as repo, patch(
+            "runtime.invocation_runtime.run_invocation_workflow", return_value=self._workflow_result,
+        ) as workflow:
+            _sync_review(repo, "review", "pi")
+
+        self.assertEqual(
+            [item.model for item in workflow.call_args.kwargs["invocations"]], ["pi-pinned"],
+        )
+
+    def test_without_a_pin_the_provider_default_is_used(self) -> None:
+        with tempfile.TemporaryDirectory() as repo, patch(
+            "runtime.invocation_runtime.run_invocation_workflow", return_value=self._workflow_result,
+        ) as workflow:
+            _sync_review(repo, "review", "pi")
+
+        self.assertEqual(
+            [item.model for item in workflow.call_args.kwargs["invocations"]], ["default"],
+        )
+
     def test_registered_agent_timeouts_are_merged_like_the_cli(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             with open(os.path.join(repo, ".mcorc.yaml"), "w", encoding="utf-8") as handle:

@@ -201,6 +201,20 @@ def _resolve_policy(repo_root: str) -> "Any":
             if _valid_timeout(seconds):
                 provider_timeouts[str(provider).strip()] = seconds
 
+    # A pin may be the documented shorthand string or the long dict form; the
+    # CLI accepts both, so the MCP path must too.
+    provider_models = dict(default.provider_models)
+    configured_models = raw.get("provider_models")
+    if isinstance(configured_models, dict):
+        for provider, entry in configured_models.items():
+            name = str(provider).strip()
+            if isinstance(entry, str):
+                model = entry.strip()
+                if model:
+                    provider_models[name] = {"model": model}
+            elif isinstance(entry, dict):
+                provider_models[name] = entry
+
     # Registered agents may carry their own timeout; an explicit
     # policy.provider_timeouts entry stays authoritative, matching the CLI.
     for agent in file_config.get("agents", []) or []:
@@ -221,6 +235,7 @@ def _resolve_policy(repo_root: str) -> "Any":
             "max_provider_parallelism", default.max_provider_parallelism,
         ),
         provider_timeouts=provider_timeouts,
+        provider_models=provider_models,
     )
 
 
@@ -272,7 +287,7 @@ def _sync_review(
     """Run the thin read-only review preset and return raw invocation outputs."""
     from .adapters import adapter_registry
     from .execution_modes import EXECUTION_MODES, execution_permissions
-    from .invocation_runtime import parse_invocations, run_invocation_workflow, validate_execution_scope
+    from .invocation_runtime import default_invocations, run_invocation_workflow, validate_execution_scope
 
     err = _validate_repo(repo)
     if err:
@@ -304,11 +319,8 @@ def _sync_review(
             ["."],
         )
         adapters = adapter_registry()
-        invocations = parse_invocations(
-            ["{}:default".format(provider) for provider in valid_providers],
-            scope,
-        )
         policy = _resolve_policy(str(repo_path))
+        invocations = default_invocations(valid_providers, scope, policy.provider_models)
         hard_timeout = _override_or(invocation_timeout_seconds, policy.timeout_seconds)
         global_timeout = _override_or(review_timeout_seconds, policy.review_hard_timeout_seconds)
         result = run_invocation_workflow(
@@ -344,7 +356,7 @@ def _sync_run(
     """General-purpose multi-agent task execution."""
     from .adapters import adapter_registry
     from .execution_modes import EXECUTION_MODES, execution_permissions
-    from .invocation_runtime import parse_invocations, run_invocation_workflow, validate_execution_scope
+    from .invocation_runtime import default_invocations, run_invocation_workflow, validate_execution_scope
 
     err = _validate_repo(repo)
     if err:
@@ -379,10 +391,7 @@ def _sync_run(
         hard_timeout = _override_or(invocation_timeout_seconds, policy.timeout_seconds)
         global_timeout = _override_or(review_timeout_seconds, policy.review_hard_timeout_seconds)
         result = run_invocation_workflow(
-            invocations=parse_invocations(
-                ["{}:default".format(provider) for provider in valid_providers],
-                scope,
-            ),
+            invocations=default_invocations(valid_providers, scope, policy.provider_models),
             adapters=adapter_registry(),
             repo_root=str(repo_path),
             prompt=prompt,
