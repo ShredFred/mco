@@ -6,11 +6,22 @@ import json
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from runtime.config import load_config_files
 
 
 class TestLoadConfigFiles(unittest.TestCase):
+    def setUp(self) -> None:
+        # Without this, any test that does not pass global_config_dir explicitly
+        # silently reads the developer's real ~/.mco/config.json and fails on a
+        # machine that happens to have one.
+        self._empty_global = tempfile.TemporaryDirectory(prefix="mco-test-global-")
+        self.addCleanup(self._empty_global.cleanup)
+        patcher = patch.dict(os.environ, {"MCO_CONFIG_DIR": self._empty_global.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_no_config_returns_empty(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             result = load_config_files(tmp)

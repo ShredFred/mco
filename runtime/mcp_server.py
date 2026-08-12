@@ -62,6 +62,81 @@ def _resolve_provider_selection(providers_csv: str) -> tuple[List[str], Optional
     return providers, None
 
 
+def _override_or(override: Any, fallback: int) -> int:
+    """Accept a positive per-call timeout override, else keep the policy value."""
+    if isinstance(override, bool) or not isinstance(override, int) or override <= 0:
+        return fallback
+    return override
+
+
+def _resolve_policy(repo_root: str) -> "Any":
+    """Resolve the effective review policy for an MCP call.
+
+    The CLI merges global (~/.mco/config.json) and project (.mcorc.json/.yaml)
+    config into its policy; the MCP path ignored both and silently fell back to
+    the hardcoded dataclass defaults. That made configured timeouts invisible to
+    every MCP tool and left runs without a global deadline.
+
+    Mirrors the CLI's timeout merge, including registered-agent `timeout`
+    entries, so the same config produces the same deadlines on both paths.
+    """
+    import sys
+
+    from .config import ReviewPolicy, load_config_files
+
+    default = ReviewPolicy()
+    try:
+        file_config = load_config_files(repo_root)
+    except Exception as exc:
+        # A broken config must not take the broker down, but it must not look
+        # like an intentional default either.
+        print("[mco] warning: falling back to default policy: {}".format(exc), file=sys.stderr)
+        return default
+    if not isinstance(file_config, dict):
+        return default
+    raw = file_config.get("policy")
+    if not isinstance(raw, dict):
+        raw = {}
+
+    def _positive_int(key: str, fallback: int) -> int:
+        value = raw.get(key, fallback)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return fallback
+        return value
+
+    def _valid_timeout(value: Any) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+    provider_timeouts = dict(default.provider_timeouts)
+    configured_timeouts = raw.get("provider_timeouts")
+    if isinstance(configured_timeouts, dict):
+        for provider, seconds in configured_timeouts.items():
+            if _valid_timeout(seconds):
+                provider_timeouts[str(provider).strip()] = seconds
+
+    # Registered agents may carry their own timeout; an explicit
+    # policy.provider_timeouts entry stays authoritative, matching the CLI.
+    for agent in file_config.get("agents", []) or []:
+        if not isinstance(agent, dict):
+            continue
+        name = str(agent.get("name", "")).strip()
+        seconds = agent.get("timeout")
+        if name and _valid_timeout(seconds) and name not in provider_timeouts:
+            provider_timeouts[name] = seconds
+
+    return ReviewPolicy(
+        timeout_seconds=_positive_int("timeout_seconds", default.timeout_seconds),
+        stall_timeout_seconds=_positive_int("stall_timeout_seconds", default.stall_timeout_seconds),
+        review_hard_timeout_seconds=_positive_int(
+            "review_hard_timeout_seconds", default.review_hard_timeout_seconds,
+        ),
+        max_provider_parallelism=_positive_int(
+            "max_provider_parallelism", default.max_provider_parallelism,
+        ),
+        provider_timeouts=provider_timeouts,
+    )
+
+
 # ── Sync helpers (called via asyncio.to_thread from async tool handlers) ──
 
 def _sync_doctor(providers_csv: Optional[str]) -> Dict[str, Any]:
@@ -103,10 +178,11 @@ def _sync_review(
     providers: str,
     target_paths: str = ".",
     execution_mode: str = "read_only",
+    invocation_timeout_seconds: int = 0,
+    review_timeout_seconds: int = 0,
 ) -> Dict[str, Any]:
     """Run the thin read-only review preset and return raw invocation outputs."""
     from .adapters import adapter_registry
-    from .config import ReviewPolicy
     from .execution_modes import EXECUTION_MODES, execution_permissions
     from .invocation_runtime import parse_invocations, run_invocation_workflow, validate_execution_scope
 
@@ -144,16 +220,21 @@ def _sync_review(
             ["{}:default".format(provider) for provider in valid_providers],
             scope,
         )
-        default_policy = ReviewPolicy()
+        policy = _resolve_policy(str(repo_path))
+        hard_timeout = _override_or(invocation_timeout_seconds, policy.timeout_seconds)
+        global_timeout = _override_or(review_timeout_seconds, policy.review_hard_timeout_seconds)
         result = run_invocation_workflow(
             invocations=invocations,
             adapters=adapters,
             repo_root=str(repo_path),
             prompt=prompt or "Review the selected scope and report any concerns in natural language.",
-            timeout_seconds=default_policy.stall_timeout_seconds,
-            hard_timeout_seconds=default_policy.timeout_seconds,
+            timeout_seconds=policy.stall_timeout_seconds,
+            hard_timeout_seconds=hard_timeout,
             provider_permissions=provider_permissions,
             allow_paths=["."],
+            provider_timeouts=policy.provider_timeouts,
+            max_provider_parallelism=policy.max_provider_parallelism,
+            global_timeout_seconds=global_timeout if global_timeout > 0 else None,
         )
     except Exception as exc:
         return _err("execution_error", str(exc))
@@ -167,10 +248,11 @@ def _sync_run(
     providers: str,
     target_paths: str = ".",
     execution_mode: str = "write",
+    invocation_timeout_seconds: int = 0,
+    review_timeout_seconds: int = 0,
 ) -> Dict[str, Any]:
     """General-purpose multi-agent task execution."""
     from .adapters import adapter_registry
-    from .config import ReviewPolicy
     from .execution_modes import EXECUTION_MODES, execution_permissions
     from .invocation_runtime import parse_invocations, run_invocation_workflow, validate_execution_scope
 
@@ -203,7 +285,9 @@ def _sync_run(
             [p.strip() for p in target_paths.split(",") if p.strip()] or ["."],
             ["."],
         )
-        default_policy = ReviewPolicy()
+        policy = _resolve_policy(str(repo_path))
+        hard_timeout = _override_or(invocation_timeout_seconds, policy.timeout_seconds)
+        global_timeout = _override_or(review_timeout_seconds, policy.review_hard_timeout_seconds)
         result = run_invocation_workflow(
             invocations=parse_invocations(
                 ["{}:default".format(provider) for provider in valid_providers],
@@ -212,10 +296,13 @@ def _sync_run(
             adapters=adapter_registry(),
             repo_root=str(repo_path),
             prompt=prompt,
-            timeout_seconds=default_policy.stall_timeout_seconds,
-            hard_timeout_seconds=default_policy.timeout_seconds,
+            timeout_seconds=policy.stall_timeout_seconds,
+            hard_timeout_seconds=hard_timeout,
             provider_permissions=provider_permissions,
             allow_paths=["."],
+            provider_timeouts=policy.provider_timeouts,
+            max_provider_parallelism=policy.max_provider_parallelism,
+            global_timeout_seconds=global_timeout if global_timeout > 0 else None,
         )
     except Exception as exc:
         return _err("execution_error", str(exc))
