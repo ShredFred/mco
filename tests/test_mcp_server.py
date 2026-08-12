@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from runtime.mcp_server import _sync_review, _sync_run
+from runtime.mcp_server import _ProgressBridge, _sync_review, _sync_run
 
 
 class McpInvocationTests(unittest.TestCase):
@@ -147,6 +148,84 @@ class McpPolicyTests(unittest.TestCase):
         self.assertEqual(
             workflow.call_args.kwargs["provider_timeouts"], {"claude": 420, "slowpoke": 900},
         )
+
+
+class ProgressBridgeTests(unittest.IsolatedAsyncioTestCase):
+    class _RecordingContext:
+        def __init__(self) -> None:
+            self.calls: list[tuple[float, float, str]] = []
+
+        async def report_progress(self, progress: float, total: float, message: str) -> None:
+            self.calls.append((progress, total, message))
+
+    class _FailingContext:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def report_progress(self, progress: float, total: float, message: str) -> None:
+            self.calls += 1
+            raise RuntimeError("no progressToken from host")
+
+    async def _drain(self) -> None:
+        # Notifications are scheduled from worker threads and their done
+        # callbacks land a further loop iteration later; yield until settled.
+        for _ in range(10):
+            await asyncio.sleep(0.01)
+
+    async def test_lifecycle_events_become_progress_notifications(self) -> None:
+        ctx = self._RecordingContext()
+        bridge = _ProgressBridge(ctx, asyncio.get_running_loop(), total=2, min_interval_seconds=0.0)
+        bridge({"type": "invocation_started", "provider": "claude"})
+        bridge({"type": "invocation_finished", "provider": "claude", "status": "success"})
+        bridge({"type": "task_finished", "status": "complete"})
+        await self._drain()
+
+        self.assertEqual([call[2] for call in ctx.calls], [
+            "claude: started", "claude: success", "run complete",
+        ])
+        self.assertEqual(ctx.calls[1][0], 1.0)
+        self.assertEqual(ctx.calls[0][1], 2.0)
+
+    async def test_output_deltas_are_throttled(self) -> None:
+        ctx = self._RecordingContext()
+        bridge = _ProgressBridge(ctx, asyncio.get_running_loop(), total=1, min_interval_seconds=3600.0)
+        for _ in range(5):
+            bridge({"type": "output_delta", "provider": "codex", "delta": "x"})
+        await self._drain()
+
+        self.assertEqual(len(ctx.calls), 1)
+
+    async def test_first_output_delta_emits_on_a_young_monotonic_clock(self) -> None:
+        # time.monotonic() has an arbitrary epoch. On a freshly booted machine it
+        # can be smaller than the throttle interval, which must not swallow the
+        # first heartbeat - that one matters most for keeping a host alive.
+        ctx = self._RecordingContext()
+        bridge = _ProgressBridge(ctx, asyncio.get_running_loop(), total=1, min_interval_seconds=3600.0)
+        with patch("time.monotonic", return_value=1.5):
+            bridge({"type": "output_delta", "provider": "codex", "delta": "x"})
+            bridge({"type": "output_delta", "provider": "codex", "delta": "y"})
+        await self._drain()
+
+        self.assertEqual([call[2] for call in ctx.calls], ["codex: working"])
+
+    async def test_unknown_events_are_dropped(self) -> None:
+        ctx = self._RecordingContext()
+        bridge = _ProgressBridge(ctx, asyncio.get_running_loop(), total=1, min_interval_seconds=0.0)
+        bridge({"type": "some_future_event", "provider": "codex"})
+        await self._drain()
+
+        self.assertEqual(ctx.calls, [])
+
+    async def test_host_without_progress_support_disables_bridge(self) -> None:
+        ctx = self._FailingContext()
+        bridge = _ProgressBridge(ctx, asyncio.get_running_loop(), total=1, min_interval_seconds=0.0)
+        bridge({"type": "invocation_started", "provider": "claude"})
+        await self._drain()
+        bridge({"type": "invocation_finished", "provider": "claude", "status": "success"})
+        await self._drain()
+
+        # One failed attempt, then silence: a run must never break on progress.
+        self.assertEqual(ctx.calls, 1)
 
 
 if __name__ == "__main__":

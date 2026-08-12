@@ -22,6 +22,93 @@ def _err(code: str, message: str) -> Dict[str, Any]:
     return {"ok": False, "error": {"code": code, "message": message}}
 
 
+# ── Progress bridge ──
+
+class _ProgressBridge:
+    """Forward runtime invocation events to MCP progress notifications.
+
+    A long broker run looks like a hang to the host: the tool call sits silent
+    for the whole run, so a client that caps request duration cancels it and the
+    provider cost is spent without producing an answer. MCP hosts reset their
+    request timeout whenever a progress notification arrives, so emitting
+    heartbeats keeps an honest long run alive.
+
+    Invoked from provider worker threads, so every notification is scheduled
+    back onto the server event loop. A failure disables the bridge rather than
+    breaking the run: a host that sent no progressToken simply gets no
+    notifications.
+    """
+
+    def __init__(self, ctx: Any, loop: Any, total: int, min_interval_seconds: float = 5.0) -> None:
+        self._ctx = ctx
+        self._loop = loop
+        self._total = max(1, total)
+        self._min_interval = min_interval_seconds
+        self._done = 0
+        # None, not 0.0: time.monotonic() has an arbitrary epoch, so comparing
+        # against 0.0 throttles away the first heartbeat on a machine whose
+        # monotonic clock is younger than the interval.
+        self._last_emit: Optional[float] = None
+        self._disabled = False
+
+    def __call__(self, event: Dict[str, Any]) -> None:
+        if self._disabled:
+            return
+        import time
+
+        event_type = str(event.get("type", ""))
+        provider = str(event.get("provider", "") or "")
+        if event_type == "invocation_finished":
+            self._done += 1
+        elif event_type == "output_delta":
+            now = time.monotonic()
+            if self._last_emit is not None and now - self._last_emit < self._min_interval:
+                return
+            self._last_emit = now
+        elif event_type not in ("invocation_started", "task_finished"):
+            return
+        self._emit(self._done, self._describe(event_type, provider, event))
+
+    @staticmethod
+    def _describe(event_type: str, provider: str, event: Dict[str, Any]) -> str:
+        if event_type == "invocation_started":
+            return "{}: started".format(provider or "provider")
+        if event_type == "output_delta":
+            return "{}: working".format(provider or "provider")
+        if event_type == "invocation_finished":
+            return "{}: {}".format(provider or "provider", event.get("status", "finished"))
+        return "run {}".format(event.get("status", "finished"))
+
+    def _emit(self, progress: int, message: str) -> None:
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self._ctx.report_progress(
+                    progress=float(progress), total=float(self._total), message=message,
+                ),
+                self._loop,
+            )
+        except Exception:
+            self._disabled = True
+            return
+        future.add_done_callback(self._check)
+
+    def _check(self, future: Any) -> None:
+        if future.cancelled() or future.exception() is not None:
+            self._disabled = True
+
+
+def _progress_callback(ctx: Any, providers: str) -> Optional[_ProgressBridge]:
+    """Build a progress bridge when the host supports it, else None."""
+    if ctx is None:
+        return None
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+    total = len([item for item in providers.split(",") if item.strip()]) or 1
+    return _ProgressBridge(ctx, loop, total)
+
+
 # ── Validation helpers ──
 
 def _is_git_repo(path: Path) -> bool:
@@ -180,6 +267,7 @@ def _sync_review(
     execution_mode: str = "read_only",
     invocation_timeout_seconds: int = 0,
     review_timeout_seconds: int = 0,
+    event_callback: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Run the thin read-only review preset and return raw invocation outputs."""
     from .adapters import adapter_registry
@@ -235,6 +323,7 @@ def _sync_review(
             provider_timeouts=policy.provider_timeouts,
             max_provider_parallelism=policy.max_provider_parallelism,
             global_timeout_seconds=global_timeout if global_timeout > 0 else None,
+            event_callback=event_callback,
         )
     except Exception as exc:
         return _err("execution_error", str(exc))
@@ -250,6 +339,7 @@ def _sync_run(
     execution_mode: str = "write",
     invocation_timeout_seconds: int = 0,
     review_timeout_seconds: int = 0,
+    event_callback: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """General-purpose multi-agent task execution."""
     from .adapters import adapter_registry
@@ -303,6 +393,7 @@ def _sync_run(
             provider_timeouts=policy.provider_timeouts,
             max_provider_parallelism=policy.max_provider_parallelism,
             global_timeout_seconds=global_timeout if global_timeout > 0 else None,
+            event_callback=event_callback,
         )
     except Exception as exc:
         return _err("execution_error", str(exc))
@@ -320,7 +411,7 @@ def ensure_mcp_installed() -> None:
 
 async def run_server() -> None:
     """Start the MCP stdio server with all MCO tools registered."""
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server.fastmcp import Context, FastMCP
 
     mcp = FastMCP("mco")
 
@@ -338,8 +429,11 @@ async def run_server() -> None:
         repo: str,
         prompt: str,
         providers: str,
+        ctx: Context,
         target_paths: str = ".",
         execution_mode: str = "read_only",
+        invocation_timeout_seconds: int = 0,
+        review_timeout_seconds: int = 0,
     ) -> dict:
         """Run a thin read-only review and return raw provider answers.
 
@@ -352,6 +446,8 @@ async def run_server() -> None:
         """
         return await asyncio.to_thread(
             _sync_review, repo, prompt, providers, target_paths, execution_mode,
+            invocation_timeout_seconds, review_timeout_seconds,
+            _progress_callback(ctx, providers),
         )
 
     @mcp.tool()
@@ -359,8 +455,11 @@ async def run_server() -> None:
         repo: str,
         prompt: str,
         providers: str,
+        ctx: Context,
         target_paths: str = ".",
         execution_mode: str = "write",
+        invocation_timeout_seconds: int = 0,
+        review_timeout_seconds: int = 0,
     ) -> dict:
         """General-purpose multi-agent task execution.
 
@@ -373,6 +472,8 @@ async def run_server() -> None:
         """
         return await asyncio.to_thread(
             _sync_run, repo, prompt, providers, target_paths, execution_mode,
+            invocation_timeout_seconds, review_timeout_seconds,
+            _progress_callback(ctx, providers),
         )
 
     await mcp.run_async(transport="stdio")
