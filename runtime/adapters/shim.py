@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import signal
 import subprocess
 import tempfile
 import time
@@ -24,6 +23,7 @@ from ..contracts import (
     TaskStatus,
 )
 from ..errors import classify_error, detect_warnings
+from ..platform import kill_process, prepare_spawn, terminate_process, user_suffix
 from ..types import ErrorKind
 
 
@@ -105,7 +105,7 @@ class ShimAdapterBase:
             raise ValueError("adapter run command is empty")
 
         artifact_root = str(input_task.metadata.get(
-            "artifact_root", os.path.join(tempfile.gettempdir(), "mco-{}".format(os.getuid())),
+            "artifact_root", os.path.join(tempfile.gettempdir(), "mco-{}".format(user_suffix())),
         ))
         paths = expected_paths(artifact_root, input_task.task_id, (self.id,))
         root = paths["root"]
@@ -119,15 +119,17 @@ class ShimAdapterBase:
 
         stdout_file = stdout_path.open("w", encoding="utf-8")
         stderr_file = stderr_path.open("w", encoding="utf-8")
+        env = _sanitize_env()
+        spawn_args, spawn_options = prepare_spawn(cmd, env)
         try:
             process = subprocess.Popen(
-                cmd,
+                spawn_args,
                 cwd=input_task.repo_root,
                 stdout=stdout_file,
                 stderr=stderr_file,
                 text=True,
-                start_new_session=True,
-                env=_sanitize_env(),
+                env=env,
+                **spawn_options,
             )
         except Exception:
             stdout_file.close()
@@ -241,7 +243,7 @@ class ShimAdapterBase:
             self._runs.pop(ref.run_id, None)
             return
         try:
-            os.killpg(os.getpgid(handle.process.pid), signal.SIGTERM)
+            terminate_process(handle.process)
         except (ProcessLookupError, OSError):
             self._close_io(handle)
             self._runs.pop(ref.run_id, None)
@@ -249,7 +251,7 @@ class ShimAdapterBase:
         time.sleep(0.2)
         if handle.process.poll() is None:
             try:
-                os.killpg(os.getpgid(handle.process.pid), signal.SIGKILL)
+                kill_process(handle.process)
             except (ProcessLookupError, OSError):
                 self._close_io(handle)
                 self._runs.pop(ref.run_id, None)

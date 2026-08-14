@@ -1,8 +1,11 @@
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 
 const runtime = require("../../scripts/install-runtime.js");
+const { spawnExecutable } = require("../../scripts/exec-util.js");
 
 test("buildNpmInstallArgv pins exact package version", () => {
   assert.deepEqual(runtime.buildNpmInstallArgv("0.10.9"), [
@@ -117,4 +120,52 @@ test("runMcoScript fails when placeholder used without allowPlaceholder", () => 
   }));
   assert.equal(result.status, 1);
   assert.equal(result.failure, "global_mco_not_found");
+});
+
+test("spawnExecutable preserves arbitrary argv for native executables", () => {
+  const args = ["two words", 'say "hi"', "100% ready", "a&b", "a|b", "a^b"];
+  const result = spawnExecutable(
+    process.execPath,
+    ["-e", "process.stdout.write(JSON.stringify(process.argv.slice(1)))", ...args],
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), args);
+});
+
+test("spawnExecutable safely preserves argv through a Windows cmd shim", {
+  skip: process.platform !== "win32",
+}, () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "mco cmd shim "));
+  const capture = path.join(root, "capture.js");
+  const shim = path.join(root, "mco-argv-test.cmd");
+  const marker = path.join(root, "injected.txt");
+  const args = [
+    "two words",
+    'say "hi"',
+    "100% ready",
+    "a^b",
+    "a|b",
+    "a>b",
+    `safe&echo PWNED>"${marker}"`,
+  ];
+
+  try {
+    fs.writeFileSync(capture, "process.stdout.write(JSON.stringify(process.argv.slice(2)));\n");
+    fs.writeFileSync(shim, '@echo off\r\n"%NODE_EXE%" "%~dp0capture.js" %*\r\n');
+    const env = {
+      ...process.env,
+      NODE_EXE: process.execPath,
+      Path: `${root};${process.env.Path || process.env.PATH || ""}`,
+      PATHEXT: ".COM;.EXE;.BAT;.CMD",
+    };
+
+    const result = spawnExecutable("mco-argv-test", args, { env });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), args);
+    assert.equal(fs.existsSync(marker), false, "cmd.exe executed an argument as shell input");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
