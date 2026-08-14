@@ -3,8 +3,6 @@
 Start with: mco serve
 Configure in MCP client: {"command": "mco", "args": ["serve"]}
 """
-from __future__ import annotations
-
 import asyncio
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -485,4 +483,4 @@ async def run_server() -> None:
             _progress_callback(ctx, providers),
         )
 
-    await mcp.run_async(transport="stdio")
+    await mcp.run_stdio_async()

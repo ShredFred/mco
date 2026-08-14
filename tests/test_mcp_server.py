@@ -3,11 +3,22 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
-from runtime.mcp_server import _ProgressBridge, _sync_review, _sync_run
+from runtime.mcp_server import _ProgressBridge, _sync_review, _sync_run, run_server
+
+
+try:
+    from mcp import ClientSession
+    from mcp.client.stdio import StdioServerParameters, stdio_client
+    from mcp.server.fastmcp import FastMCP
+except ImportError:
+    ClientSession = None
+    FastMCP = None
 
 
 class McpInvocationTests(unittest.TestCase):
@@ -51,6 +62,34 @@ class McpInvocationTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertNotIn("findings", result["data"])
         self.assertEqual(workflow.call_args.kwargs["hard_timeout_seconds"], 180)
+
+
+@unittest.skipIf(FastMCP is None, "mcp optional dependency is not installed")
+class McpServerRegistrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_serve_registers_tools_and_starts_stdio_transport(self) -> None:
+        with patch.object(FastMCP, "run_stdio_async", new_callable=AsyncMock) as run_stdio:
+            await run_server()
+
+        run_stdio.assert_awaited_once_with()
+
+    async def test_serve_exposes_tools_without_context_in_client_schema(self) -> None:
+        root = Path(__file__).resolve().parent.parent
+        server = StdioServerParameters(
+            command=sys.executable,
+            args=[str(root / "mco"), "serve"],
+            cwd=root,
+        )
+
+        with tempfile.TemporaryFile(mode="w+") as errlog:
+            async with stdio_client(server, errlog=errlog) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    result = await session.list_tools()
+
+        tools = {tool.name: tool for tool in result.tools}
+        self.assertEqual(set(tools), {"mco_doctor", "mco_review", "mco_run"})
+        self.assertNotIn("ctx", tools["mco_review"].inputSchema["properties"])
+        self.assertNotIn("ctx", tools["mco_run"].inputSchema["properties"])
 
 
 class McpPolicyTests(unittest.TestCase):

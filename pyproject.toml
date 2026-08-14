@@ -28,7 +28,7 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-memory = ["mcp>=1.0"]
+memory = ["mcp>=1.29,<2"]
 
 [project.urls]
 Homepage = "https://github.com/mco-org/mco"

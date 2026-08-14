@@ -540,7 +540,12 @@ def run_invocations(
             while pending:
                 wait_timeout = 0.05
                 if deadline is not None:
-                    wait_timeout = min(wait_timeout, max(0.0, deadline - time.monotonic()))
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        stop_state["reason"] = "timeout"
+                        stop_event.set()
+                    else:
+                        wait_timeout = min(wait_timeout, remaining)
                 done, pending = wait(pending, timeout=wait_timeout, return_when=FIRST_COMPLETED)
                 for future in done:
                     index = futures[future]
@@ -587,9 +592,6 @@ def run_invocations(
                     if "usage" in result:
                         event["usage"] = result["usage"]
                     _notify(event_callback, event)
-                if deadline is not None and pending and time.monotonic() >= deadline:
-                    stop_state["reason"] = "timeout"
-                    stop_event.set()
                 if stop_event.is_set():
                     for future in pending:
                         future.cancel()

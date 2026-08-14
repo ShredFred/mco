@@ -27,6 +27,9 @@ jobs:
       - name: Install test dependencies
         run: sudo apt-get update && sudo apt-get install -y jq ripgrep
 
+      - name: Install MCP integration dependency
+        run: python3 -m pip install -e '.[memory]'
+
       - name: Run runtime gate tests
         run: ./scripts/run_runtime_gate_tests.sh
 
