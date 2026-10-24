@@ -13,6 +13,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional
 from .adapters import adapter_registry
 from .config import DIVISION_DIMENSIONS, ReviewConfig, ReviewPolicy, load_agent_registrations
 from .contracts import ProviderPresence, TaskInput
+from .write_ownership import WriteConflict
 from .execution_modes import EXECUTION_MODES, execution_permissions
 from .invocation_runtime import AgentInvocation, default_invocations, parse_invocations, run_invocation_workflow, validate_execution_scope
 from .models import discover_models
@@ -1074,6 +1075,8 @@ def _add_common_execution_args(parser: argparse.ArgumentParser) -> None:
         ).format(SUPPORTED_PROVIDER_LIST),
     )
     scope.add_argument("--target-paths", default=".", help="Comma-separated task scope paths")
+    scope.add_argument("--write-owner", default="", help="Exclusive local checkout writer; serializes invocations")
+    scope.add_argument("--ticket-ref", default="", help="Opaque outer-harness ticket reference")
     scope.add_argument("--task-id", default="", help="Optional stable task id")
     scope.add_argument(
         "--transport",
@@ -1428,6 +1431,9 @@ def build_parser() -> argparse.ArgumentParser:
     sess_send.add_argument("prompt", nargs="?", default="", help="Prompt text")
     sess_send.add_argument("--file", default="", help="Read prompt from file, or '-' for stdin")
     sess_send.add_argument("--repo", default=".", help="Repository root path")
+    sess_send.add_argument("--execution-mode", choices=EXECUTION_MODES, default="read_only", help="Session turn permissions (default: read_only)")
+    sess_send.add_argument("--request-key", default="", help="Stable caller key for idempotent submission")
+    sess_send.add_argument("--ticket-ref", default="", help="Opaque outer-harness ticket reference")
     sess_send.add_argument("--no-wait", action="store_true", help="Return after queuing, don't wait for result")
     sess_send.add_argument("--json", action="store_true", help="JSON output")
 
@@ -1467,6 +1473,8 @@ def build_parser() -> argparse.ArgumentParser:
     sess_cancel = session_sub.add_parser("cancel", help="Cancel running + queued prompts", formatter_class=_HelpFormatter)
     sess_cancel.add_argument("name", help="Session name")
     sess_cancel.add_argument("--repo", default=".", help="Repository root path")
+    sess_cancel.add_argument("--request-id", type=int, help="Cancel only this request; omit for cancel-all")
+    sess_cancel.add_argument("--attempt-id", default="", help="Expected running attempt identity")
     sess_cancel.add_argument("--json", action="store_true", help="JSON output")
 
     sess_queue = session_sub.add_parser("queue", help="Show queue status", formatter_class=_HelpFormatter)
@@ -1786,8 +1794,15 @@ def _handle_session(args: argparse.Namespace) -> int:
         if not prompt:
             print("Prompt is required (positional, --file, or piped stdin).", file=sys.stderr)
             return 2
+        options = {}
+        if getattr(args, "execution_mode", "read_only") != "read_only":
+            options["execution_mode"] = args.execution_mode
+        if getattr(args, "request_key", ""):
+            options["request_key"] = args.request_key
+        if getattr(args, "ticket_ref", ""):
+            options["ticket_ref"] = args.ticket_ref
         if getattr(args, "no_wait", False):
-            result = send_prompt_nowait(repo_root, args.name, prompt)
+            result = send_prompt_nowait(repo_root, args.name, prompt, **options)
             if getattr(args, "json", False):
                 print(json.dumps(result, ensure_ascii=True))
             else:
@@ -1797,12 +1812,12 @@ def _handle_session(args: argparse.Namespace) -> int:
                 else:
                     print("Error: {}".format(result.get("message", "unknown")), file=sys.stderr)
                     return 2
-            return 0
+            return 0 if result.get("status") in ("queued", "ok") else 2
         try:
-            result = send_prompt(repo_root, args.name, prompt)
+            result = send_prompt(repo_root, args.name, prompt, **options)
         except KeyboardInterrupt:
             print("\nCancelling...", file=sys.stderr)
-            client_cancel(repo_root, args.name)
+            # The client already scoped cancellation to its request key.
             return 130
         if getattr(args, "json", False):
             print(json.dumps(result, ensure_ascii=True))
@@ -1812,7 +1827,7 @@ def _handle_session(args: argparse.Namespace) -> int:
             else:
                 print("Error: {}".format(result.get("message", "unknown error")), file=sys.stderr)
                 return 2
-        return 0
+        return 0 if result.get("status") == "ok" else 2
 
     if args.session_action == "broadcast":
         results = broadcast_prompt(repo_root, args.prompt)
@@ -1879,7 +1894,8 @@ def _handle_session(args: argparse.Namespace) -> int:
         return 0
 
     if args.session_action == "cancel":
-        result = client_cancel(repo_root, args.name)
+        result = client_cancel(repo_root, args.name, getattr(args, "request_id", None),
+                               getattr(args, "attempt_id", ""))
         if getattr(args, "json", False):
             print(json.dumps(result, ensure_ascii=True))
         else:
@@ -1892,7 +1908,7 @@ def _handle_session(args: argparse.Namespace) -> int:
             else:
                 print("Error: {}".format(result.get("message", "unknown error")), file=sys.stderr)
                 return 2
-        return 0
+        return 0 if result.get("status") == "ok" else 2
 
     if args.session_action == "result":
         result = get_result(repo_root, args.name, args.request_id)
@@ -1908,7 +1924,7 @@ def _handle_session(args: argparse.Namespace) -> int:
             else:
                 print("Error: {}".format(result.get("message", "unknown error")), file=sys.stderr)
                 return 2
-        return 0
+        return 0 if result.get("status") == "ok" else (1 if result.get("status") == "pending" else 2)
 
     if args.session_action == "queue":
         result = queue_status(repo_root, args.name)
@@ -2444,6 +2460,8 @@ def main(argv: List[str] | None = None) -> int:
                 event_callback = _emit_text
         try:
             payload = run_invocation_workflow(
+                write_owner=getattr(args, "write_owner", ""),
+                ticket_ref=getattr(args, "ticket_ref", ""),
                 invocations=invocations,
                 adapters=adapter_map,
                 repo_root=repo_root,
@@ -2475,6 +2493,8 @@ def main(argv: List[str] | None = None) -> int:
             )
         except ValueError as exc:
             return _invocation_error("input_error", str(exc))
+        except WriteConflict as exc:
+            return _invocation_error("write_conflict", str(exc))
         finally:
             signal.signal(signal.SIGINT, previous_sigint)
             if stream_renderer is not None:

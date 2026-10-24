@@ -350,6 +350,8 @@ def _sync_run(
     invocation_timeout_seconds: int = 0,
     review_timeout_seconds: int = 0,
     event_callback: Optional[Any] = None,
+    write_owner: str = "",
+    ticket_ref: str = "",
 ) -> Dict[str, Any]:
     """General-purpose multi-agent task execution."""
     from .adapters import adapter_registry
@@ -389,6 +391,8 @@ def _sync_run(
         hard_timeout = _override_or(invocation_timeout_seconds, policy.timeout_seconds)
         global_timeout = _override_or(review_timeout_seconds, policy.review_hard_timeout_seconds)
         result = run_invocation_workflow(
+            write_owner=write_owner,
+            ticket_ref=ticket_ref,
             invocations=default_invocations(valid_providers, scope, policy.provider_models),
             adapters=adapter_registry(),
             repo_root=str(repo_path),
@@ -406,6 +410,18 @@ def _sync_run(
         return _err("execution_error", str(exc))
 
     return _ok(result)
+
+
+def _sync_session_submit(repo: str, name: str, prompt: str, request_key: str,
+                         ticket_ref: str = "", execution_mode: str = "read_only") -> Dict[str, Any]:
+    from .session.client import send_prompt_nowait
+    error = _validate_repo(repo)
+    if error:
+        return error
+    if not request_key.strip():
+        return _err("invalid_request_key", "Provide a stable caller-owned request key")
+    return _ok(send_prompt_nowait(str(Path(repo).resolve()), name, prompt,
+               request_key=request_key, ticket_ref=ticket_ref, execution_mode=execution_mode))
 
 
 # ── MCP Server ──
@@ -467,6 +483,8 @@ async def run_server() -> None:
         execution_mode: str = "write",
         invocation_timeout_seconds: int = 0,
         review_timeout_seconds: int = 0,
+        write_owner: str = "",
+        ticket_ref: str = "",
     ) -> dict:
         """General-purpose multi-agent task execution.
 
@@ -480,7 +498,31 @@ async def run_server() -> None:
         return await asyncio.to_thread(
             _sync_run, repo, prompt, providers, target_paths, execution_mode,
             invocation_timeout_seconds, review_timeout_seconds,
-            _progress_callback(ctx, providers),
+            _progress_callback(ctx, providers), write_owner, ticket_ref,
         )
+
+    @mcp.tool()
+    async def mco_session_submit(repo: str, name: str, prompt: str, request_key: str,
+                                 ticket_ref: str = "", execution_mode: str = "read_only") -> dict:
+        """Submit to an existing session and return a durable receipt. Retry lost ACKs with the same key.
+
+        The outer harness owns provider selection, ticket state and external worktrees.
+        Disconnecting after submission does not cancel accepted work. Use result/cancel explicitly.
+        """
+        return await asyncio.to_thread(_sync_session_submit, repo, name, prompt, request_key,
+                                       ticket_ref, execution_mode)
+
+    @mcp.tool()
+    async def mco_session_result(repo: str, name: str, request_id: int) -> dict:
+        """Read a queued/running/terminal receipt, including after daemon shutdown."""
+        from .session.client import get_result
+        return _ok(await asyncio.to_thread(get_result, str(Path(repo).resolve()), name, request_id))
+
+    @mcp.tool()
+    async def mco_session_cancel(repo: str, name: str, request_id: int, attempt_id: str = "") -> dict:
+        """Request cancellation of exactly one request; receipt does not prove child termination."""
+        from .session.client import cancel_session
+        return _ok(await asyncio.to_thread(cancel_session, str(Path(repo).resolve()), name,
+                                           request_id, attempt_id))
 
     await mcp.run_stdio_async()

@@ -1,0 +1,30 @@
+Delegation hardening — 2026-10-24
+
+Scope and base
+The follow-up authorized implementation, README updates and integration into the fork's main. Work started from fef0573, then fast-forwarded this branch to the existing local main aa5e6c7 (0.12.1). Upstream was only a configured remote and received no writes. The separate main worktree was not changed. REPORT.txt, probe-output.txt and issues/ are historical pre-implementation audit material, not current open/closed ticket assertions. Fork issues were disabled, so no real issue IDs were invented.
+
+Round 1: durable session execution
+Added SQLite acceptance before acknowledgement, caller-owned submit keys with payload conflicts, stable request IDs, persisted queued/running/terminal receipts, offline terminal lookup, retained provider evidence, and worker-boundary exception handling. Resume restores queued requests and marks interrupted running requests unknown rather than replaying them. Explicit session execution modes default to read_only; write/yolo disable automatic retries. Opaque ticket references flow through receipts and provider TaskInput metadata.
+
+Round 2: ownership, lifecycle, interfaces
+Added request-scoped and expected-attempt cancellation, Ctrl+C scoped by submit key even before acknowledgement, durable queued cancellation, and nonzero CLI JSON failure exit codes. Daemon readiness checks incarnation/PID/worker health; stored PIDs are never used as fallback signal targets. OS locks prevent duplicate daemons and concurrent named start/resume operations; state JSON replacement is atomic.
+Session writes acquire a persistent exclusive checkout lease. Canonical Git checkout identity (including external worktrees), owner, ticket reference and base commit are recorded. Symlink/subdirectory aliases resolve to the checkout root. Unknown exits keep the lease; there is no automatic crash takeover. Legacy run/review can opt in with --write-owner; guarded workflows serialize invocations. Unguarded legacy calls and other tools remain the external harness's responsibility.
+MCP exposes session submit/result/cancel over the same clients as CLI; its existing blocking tools remain compatible. README distinguishes these interfaces and the fork checkout installation from the upstream npm release.
+
+Regression evidence
+New tests cover duplicate/lost receipts, payload conflict, queued/result/cancel behavior, worker recovery after injected exceptions, restart/id persistence, concurrent same-key submits, unverified PID safety, attempt mismatch, CLI JSON failures, MCP delegation, write conflicts, lease retention, request-scoped Ctrl+C, real Unix-socket daemon stop/restart with a fake dispatch, disabled write retries, guarded workflow serialization, and duplicate daemon locking. The old worker-survival test now actually submits the raising request and checks a successful follow-up.
+The clean aa5e6c7 archive baseline passed 485 Python tests, with four optional tests skipped, using Python 3.11. Python 3.9 from the system python3 failed the supported-version precondition; subsequent validation uses a temporary Python 3.11 venv with the existing optional MCP dependency. Missing Node dependencies were resolved by npm ci, without changing dependencies or lockfiles. Packaging must also use Python 3.10+ on PATH, not only MCO_PYTHON for the launcher.
+Final verification results are appended below after checks finish.
+
+Deliberate limits / remaining work
+This is a bounded implementation, not proof of all six original draft acceptance lists. Do not automatically close/publish those drafts without reconciling their scope. Remaining work includes a supported explicit lease reconciliation command, finer per-provider retry-attempt receipts (attempt_id currently identifies a worker dispatch), real provider crash/descendant termination checks, Windows end-to-end session coverage, durable submission for legacy run/review, and MCP start/ensure support. There is no automatic lease takeover, rollback, distributed locking, ticket system, worktree manager, auto-merge policy, release, or deployment. Completion/transport receipts do not prove product correctness. Retention is explicit external ownership; no result/log purge is implemented.
+
+Final verification (unchanged runtime/test sources after these checks)
+python: Ran 504 tests in 89.098s; OK (skipped=2)
+node: 25 tests; pass 24, fail 0, skipped 1 (Windows cmd shim)
+mcp: Ran 17 tests; OK, including registered schema/stdio checks
+packaging: npm packaging smoke: PASS
+skill: PASS
+version: PASS (0.12.1)
+diff: exit 0
+No real providers or additional agents were launched. No release or deployment was performed. Integration target is only the fork remote main; the separately checked-out local main worktree remains untouched.

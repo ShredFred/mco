@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .requests import RequestStore, result_receipt
+
 from .state import (
     SessionState,
     HistoryEntry,
@@ -42,6 +44,8 @@ class _QueuedRequest:
     done: threading.Event = field(default_factory=threading.Event)
     result: Optional[Dict[str, Any]] = None
     cancelled: bool = False
+    attempt_id: str = ""
+    options: Dict[str, Any] = field(default_factory=dict)
 
 
 _MAX_COMPLETED_RESULTS = 50  # Keep last N completed results for nowait retrieval
@@ -54,10 +58,13 @@ class _DaemonContext:
         self.request_queue: queue.Queue[_QueuedRequest] = queue.Queue(
             maxsize=_MAX_QUEUE_DEPTH,
         )
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.current_request: Optional[_QueuedRequest] = None
         self.cancel_event = threading.Event()
-        self.next_id = 1
+        self.store: Optional[RequestStore] = None
+        self.requests: Dict[int, _QueuedRequest] = {}
+        self.worker: Optional[threading.Thread] = None
+        self.health_error = ""
         self.running = True
         # Store completed results for nowait retrieval
         self.completed_results: Dict[int, Dict[str, Any]] = {}
@@ -108,6 +115,7 @@ def _run_single_attempt(
                 "response": _extract_response(raw_stdout, raw_stderr),
                 "error": "Cancelled",
                 "error_kind": "cancelled",
+                "outcome_unknown": True,
                 "wall_clock_seconds": round(time.time() - started, 2),
             }
 
@@ -128,6 +136,7 @@ def _run_single_attempt(
                 "response": _extract_response(raw_stdout, raw_stderr),
                 "error": "Provider timed out after {}s".format(_STALL_TIMEOUT_SECONDS),
                 "error_kind": "retryable_timeout",
+                "outcome_unknown": True,
                 "wall_clock_seconds": round(time.time() - started, 2),
             }
 
@@ -135,7 +144,7 @@ def _run_single_attempt(
     raw_stdout, raw_stderr = _read_output(run_ref.artifact_path, provider)
     response = _extract_response(raw_stdout, raw_stderr)
 
-    success = status.attempt_state == "SUCCEEDED"
+    success = status.attempt_state == "SUCCEEDED" and type(status.exit_code) is int and status.exit_code == 0
     if not success:
         # Classify the error for retry decisions
         from ..errors import classify_error
@@ -146,12 +155,15 @@ def _run_single_attempt(
             "response": response,
             "error": status.message if hasattr(status, "message") else "Provider failed",
             "error_kind": error_kind.value,
+            "termination_confirmed": type(status.exit_code) is int,
+            "outcome_unknown": type(status.exit_code) is not int,
             "wall_clock_seconds": wall_clock,
         }
 
     return {
         "success": True,
         "response": response,
+        "termination_confirmed": isinstance(status.exit_code, int),
         "wall_clock_seconds": wall_clock,
     }
 
@@ -165,6 +177,7 @@ def _dispatch_prompt(
     repo_root: str,
     prompt: str,
     cancel_event: Optional[threading.Event] = None,
+    options: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run a single prompt through the provider adapter with retry support.
 
@@ -178,20 +191,27 @@ def _dispatch_prompt(
     adapters = _doctor_adapter_registry()
     adapter = adapters.get(provider)
     if adapter is None:
-        return {"success": False, "response": "", "error": "No adapter for provider: {}".format(provider)}
+        return {"success": False, "response": "", "termination_confirmed": True, "error": "No adapter for provider: {}".format(provider)}
 
     presence = adapter.detect()
     if not presence.detected or not presence.auth_ok:
-        return {"success": False, "response": "", "error": "Provider not available: {}".format(provider)}
+        return {"success": False, "response": "", "termination_confirmed": True, "error": "Provider not available: {}".format(provider)}
 
+    from ..execution_modes import execution_permissions
+    options = options or {}
+    execution_mode = options.get("execution_mode", "read_only")
+    permissions = execution_permissions(provider, execution_mode)
+    if permissions is None:
+        return {"success": False, "termination_confirmed": True, "error": "Unsupported execution mode for provider"}
     retry_policy = RetryPolicy()
+    max_retries = retry_policy.max_retries if execution_mode == "read_only" else 0
     total_started = time.time()
     last_result: Optional[Dict[str, Any]] = None
 
     import tempfile
     import uuid
 
-    for attempt in range(1, retry_policy.max_retries + 2):  # 1 initial + max_retries
+    for attempt in range(1, max_retries + 2):  # 1 initial + max_retries
         # Check cancellation before each attempt
         if cancel_event and cancel_event.is_set():
             return {
@@ -202,7 +222,10 @@ def _dispatch_prompt(
                 "attempts": attempt - 1,
             }
 
-        with tempfile.TemporaryDirectory(prefix="mco-session-") as artifact_dir:
+        from contextlib import nullcontext
+        artifact_context = (nullcontext(options["artifact_root"]) if options.get("artifact_root")
+                            else tempfile.TemporaryDirectory(prefix="mco-session-"))
+        with artifact_context as artifact_dir:
             unique_id = "session-{}-{}".format(int(time.time()), uuid.uuid4().hex[:8])
             task_input = TaskInput(
                 task_id=unique_id,
@@ -210,11 +233,15 @@ def _dispatch_prompt(
                 repo_root=repo_root,
                 target_paths=["."],
                 timeout_seconds=_STALL_TIMEOUT_SECONDS,
-                metadata={"artifact_root": artifact_dir},
+                metadata={"artifact_root": artifact_dir, "provider_permissions": permissions,
+                          "request_id": options.get("request_id"),
+                          "attempt_id": options.get("attempt_id"),
+                          "ticket_ref": options.get("ticket_ref", "")},
             )
 
             result = _run_single_attempt(adapter, task_input, provider, cancel_event)
             result["attempts"] = attempt
+            result["artifact_root"] = str(artifact_dir) if options.get("artifact_root") else None
             last_result = result
 
             if result["success"]:
@@ -222,7 +249,7 @@ def _dispatch_prompt(
 
             # Check if error is retryable
             error_kind = result.get("error_kind", "")
-            if error_kind not in _RETRYABLE_ERROR_KINDS or attempt > retry_policy.max_retries:
+            if error_kind not in _RETRYABLE_ERROR_KINDS or attempt > max_retries:
                 return result
 
             # Backoff before retry
@@ -244,80 +271,134 @@ def _worker_loop(
     repo_root: str,
 ) -> None:
     """Worker thread — processes queued requests one at a time."""
+    import uuid
     while ctx.running:
-        try:
-            req = ctx.request_queue.get(timeout=1.0)
-        except queue.Empty:
+        with ctx.lock:
+            try:
+                req = ctx.request_queue.get_nowait()
+            except queue.Empty:
+                req = None
+            if req is not None:
+                ctx.current_request = req
+                ctx.cancel_event.clear()
+        if req is None:
+            time.sleep(0.05)
             continue
 
-        # Mark as current
-        with ctx.lock:
-            ctx.current_request = req
-            ctx.cancel_event.clear()
-
-        # Skip if already cancelled before worker picked it up
-        if req.cancelled:
-            req.result = {
-                "status": "error",
-                "response": "",
-                "message": "Cancelled before execution",
-                "wall_clock_seconds": 0,
+        writer = None
+        dispatched = False
+        try:
+            if req.cancelled:
+                continue
+            req.attempt_id = uuid.uuid4().hex
+            if ctx.store:
+                ctx.store.update(req.request_id, status="pending", lifecycle="running",
+                                 attempt_id=req.attempt_id)
+            history = load_history(repo_root, state.name)
+            full_prompt = build_history_prompt(history, req.prompt)
+            options = dict(req.options, request_id=req.request_id, attempt_id=req.attempt_id,
+                           artifact_root=str(session_dir(repo_root, state.name) / "requests" / str(req.request_id) / req.attempt_id))
+            if req.options.get("execution_mode", "read_only") != "read_only":
+                from ..write_ownership import CheckoutWriter
+                writer = CheckoutWriter(repo_root, "{}:{}:{}".format(state.name, req.request_id, req.attempt_id),
+                                        req.options.get("ticket_ref", ""))
+                writer.acquire()
+            dispatched = True
+            result = _dispatch_prompt(state.provider, repo_root, full_prompt, ctx.cancel_event, options)
+            if writer and result.get("termination_confirmed", False):
+                writer.release()
+                writer = None
+            success = result.get("success", False)
+            cancelled = ctx.cancel_event.is_set()
+            if success and result.get("response") and not cancelled:
+                append_history(repo_root, state.name, HistoryEntry(role="user", content=req.prompt))
+                append_history(repo_root, state.name, HistoryEntry(
+                    role="assistant", content=result["response"],
+                    wall_clock_seconds=result.get("wall_clock_seconds", 0)))
+                state.turn_count += 1
+            state.last_active = _now_iso()
+            save_state(repo_root, state)
+            response = {
+                "status": "ok" if success else "error",
+                "lifecycle": "succeeded" if success else "failed",
+                "response": result.get("response", ""),
+                "wall_clock_seconds": result.get("wall_clock_seconds", 0),
+                "attempt_id": req.attempt_id,
+                "attempts": result.get("attempts", 1),
+                "artifact_root": result.get("artifact_root"),
             }
-            req.done.set()
+            if result.get("outcome_unknown"):
+                response.update(status="unknown", lifecycle="unknown", termination_confirmed=False)
+            if cancelled:
+                # The adapter cancel API does not prove child termination.
+                response.update(status="cancelled", lifecycle="unknown",
+                                cancellation_requested=True, termination_confirmed=False,
+                                message="Cancellation requested; verify provider termination before retry")
+            elif not success and result.get("error"):
+                response["message"] = result["error"]
+            _finish_request(ctx, req, response)
+        except Exception as exc:
+            logging.exception("Session request %s failed", req.request_id)
+            try:
+                _finish_request(ctx, req, {
+                    "status": "unknown" if dispatched else "error",
+                    "lifecycle": "unknown" if dispatched else "failed", "message": str(exc),
+                    "code": "execution_unknown" if dispatched else "pre_dispatch_failure",
+                    "attempt_id": req.attempt_id,
+                })
+            except Exception as persist_exc:
+                ctx.health_error = str(persist_exc)
+                req.result = {"status": "unknown", "request_id": req.request_id,
+                              "message": "Cannot persist outcome: {}".format(persist_exc)}
+                req.done.set()
+        finally:
             with ctx.lock:
                 ctx.current_request = None
-            continue
+                ctx.requests.pop(req.request_id, None)
 
-        # Build prompt with conversation history
-        history = load_history(repo_root, state.name)
-        full_prompt = build_history_prompt(history, req.prompt)
 
-        # Dispatch to agent
-        result = _dispatch_prompt(
-            state.provider, repo_root, full_prompt, ctx.cancel_event,
-        )
+def _finish_request(ctx: _DaemonContext, req: _QueuedRequest, response: Dict[str, Any]) -> None:
+    response = dict(response, request_id=req.request_id)
+    if ctx.store:
+        response = ctx.store.update(req.request_id, **{k: v for k, v in response.items() if k != "request_id"})
+    req.result = response
+    with ctx.lock:
+        ctx.completed_results[req.request_id] = response
+        if len(ctx.completed_results) > _MAX_COMPLETED_RESULTS:
+            del ctx.completed_results[min(ctx.completed_results)]
+    req.done.set()
 
-        # Build response
-        success = result.get("success", False)
-        cancelled = ctx.cancel_event.is_set()
 
-        if success and result.get("response") and not cancelled:
-            # Record history on success
-            append_history(repo_root, state.name, HistoryEntry(
-                role="user", content=req.prompt,
-            ))
-            append_history(repo_root, state.name, HistoryEntry(
-                role="assistant",
-                content=result["response"],
-                wall_clock_seconds=result.get("wall_clock_seconds", 0),
-            ))
-            state.turn_count += 1
-
-        state.last_active = _now_iso()
-        save_state(repo_root, state)
-
-        response: Dict[str, Any] = {
-            "status": "ok" if success else "error",
-            "response": result.get("response", ""),
-            "wall_clock_seconds": result.get("wall_clock_seconds", 0),
-            "request_id": req.request_id,
-        }
-        if cancelled:
-            response["status"] = "cancelled"
-            response["message"] = "Cancelled"
-        elif not success and result.get("error"):
-            response["message"] = result["error"]
-
-        req.result = response
-        req.done.set()
-
-        with ctx.lock:
-            ctx.current_request = None
-            # Store for nowait retrieval — evict oldest if over limit
-            ctx.completed_results[req.request_id] = response
-            if len(ctx.completed_results) > _MAX_COMPLETED_RESULTS:
-                oldest = min(ctx.completed_results)
-                del ctx.completed_results[oldest]
+def _cancel_requests(ctx: _DaemonContext, request_id: Optional[int] = None,
+                     attempt_id: Optional[str] = None) -> Dict[str, Any]:
+    with ctx.lock:
+        current = ctx.current_request
+        if attempt_id and (current is None or current.request_id != request_id or current.attempt_id != attempt_id):
+            return {"status": "error", "code": "attempt_mismatch", "cancelled": 0,
+                    "message": "Cancellation does not match the current attempt"}
+        count = 0
+        if current is not None and (request_id is None or current.request_id == request_id):
+            ctx.cancel_event.set()
+            count += 1
+        retained = []
+        while True:
+            try:
+                queued = ctx.request_queue.get_nowait()
+            except queue.Empty:
+                break
+            if request_id is not None and queued.request_id != request_id:
+                retained.append(queued)
+                continue
+            queued.cancelled = True
+            _finish_request(ctx, queued, {"status": "cancelled", "lifecycle": "cancelled",
+                "response": "", "message": "Cancelled before execution", "wall_clock_seconds": 0,
+                "termination_confirmed": True})
+            ctx.requests.pop(queued.request_id, None)
+            count += 1
+        for queued in retained:
+            ctx.request_queue.put_nowait(queued)
+        return {"status": "ok", "request_id": request_id, "cancelled": count,
+                "cancellation_requested": bool(count)}
 
 
 _MAX_REQUEST_SIZE = 1024 * 1024  # 1 MB
@@ -358,122 +439,91 @@ def _handle_connection(
             return True
 
         action = request.get("action", "")
+        expected = request.get("daemon_id")
+        if expected is not None and expected != state.daemon_id:
+            _send_response(conn, {"status": "error", "code": "daemon_mismatch", "message": "Daemon incarnation changed"})
+            return True
+        with ctx.lock:
+            if ctx.store is None:
+                ctx.store = RequestStore(repo_root, state.name)
 
         if action == "ping":
-            _send_response(conn, {"status": "pong"})
+            healthy = not ctx.health_error and (ctx.worker is None or ctx.worker.is_alive())
+            _send_response(conn, {"status": "pong" if healthy else "unhealthy",
+                                  "daemon_id": state.daemon_id, "pid": state.pid})
             return True
 
         if action == "shutdown":
-            # Drain and cancel all queued requests
-            while not ctx.request_queue.empty():
-                try:
-                    queued = ctx.request_queue.get_nowait()
-                    queued.cancelled = True
-                    queued.result = {
-                        "status": "cancelled",
-                        "response": "",
-                        "message": "Session shutting down",
-                        "wall_clock_seconds": 0,
-                    }
-                    queued.done.set()
-                except queue.Empty:
-                    break
-            # Cancel current request if any
             with ctx.lock:
-                if ctx.current_request is not None:
-                    ctx.cancel_event.set()
+                ctx.running = False
+                _cancel_requests(ctx)
             _send_response(conn, {"status": "shutdown_ack"})
             return False
 
         if action == "send":
             prompt = request.get("prompt", "")
-            if not prompt:
-                _send_response(conn, {"status": "error", "message": "Empty prompt"})
+            if not isinstance(prompt, str) or not prompt.strip():
+                _send_response(conn, {"status": "error", "message": "Empty prompt or invalid type"})
                 return True
-
-            nowait = bool(request.get("nowait", False))
-
-            # Create queued request
+            for key in ("request_key", "ticket_ref"):
+                if key in request and (not isinstance(request[key], str) or not request[key].strip()):
+                    _send_response(conn, {"status": "error", "message": "Invalid {}".format(key)})
+                    return True
+            execution_mode = request.get("execution_mode", "read_only")
+            if execution_mode not in ("read_only", "write", "yolo"):
+                _send_response(conn, {"status": "error", "message": "Invalid execution_mode"})
+                return True
+            payload = {"prompt": prompt, "request_key": request.get("request_key", ""),
+                       "ticket_ref": request.get("ticket_ref", ""), "execution_mode": execution_mode}
             with ctx.lock:
-                request_id = ctx.next_id
-                ctx.next_id += 1
-
-            req = _QueuedRequest(request_id=request_id, prompt=prompt)
-
-            try:
-                ctx.request_queue.put_nowait(req)
-            except queue.Full:
-                _send_response(conn, {
-                    "status": "error",
-                    "message": "Queue full ({} pending). Try again later.".format(_MAX_QUEUE_DEPTH),
-                })
+                if not ctx.running or ctx.health_error:
+                    _send_response(conn, {"status": "error", "code": "unavailable",
+                                          "message": "Session stopping or unhealthy"})
+                    return True
+                # Duplicate receipts remain queryable even when the queue is full.
+                if ctx.request_queue.full():
+                    with ctx.store.connect() as db:
+                        exists = db.execute('SELECT id FROM requests WHERE request_key=?',
+                                            (payload["request_key"] or None,)).fetchone()
+                    if not exists:
+                        _send_response(conn, {"status": "error", "message": "Queue full"})
+                        return True
+                try:
+                    receipt, created = ctx.store.accept(payload)
+                except ValueError as exc:
+                    _send_response(conn, {"status": "error", "code": "request_conflict", "message": str(exc)})
+                    return True
+                request_id = receipt["request_id"]
+                if created:
+                    req = _QueuedRequest(request_id=request_id, prompt=prompt, options=payload)
+                    ctx.requests[request_id] = req
+                    ctx.request_queue.put_nowait(req)
+                else:
+                    req = ctx.requests.get(request_id)
+                ack = dict(receipt, position=ctx.request_queue.qsize())
+                if receipt["lifecycle"] in ("queued", "running"):
+                    ack["status"] = "queued"
+            _send_response(conn, ack)
+            if request.get("nowait", False) or req is None or receipt["lifecycle"] not in ("queued", "running"):
                 return True
-
-            # Tell client the request is queued with its position
-            position = ctx.request_queue.qsize()
-            _send_response(conn, {
-                "status": "queued",
-                "request_id": request_id,
-                "position": position,
-            })
-
-            # For nowait requests, return immediately — worker will still
-            # process the request but result is retrieved via history/queue status.
-            if nowait:
-                return True
-
-            # Block until worker processes this request
             req.done.wait()
-
-            # Send the actual result
-            if req.result is not None:
-                _send_response(conn, req.result)
-            else:
-                _send_response(conn, {
-                    "status": "error",
-                    "message": "Request dropped",
-                    "request_id": request_id,
-                })
+            _send_response(conn, req.result or {"status": "unknown", "request_id": request_id})
             return True
 
         if action == "cancel":
-            with ctx.lock:
-                current = ctx.current_request
-                if current is not None:
-                    ctx.cancel_event.set()
-                    running_id = current.request_id
-
-            if current is None:
-                _send_response(conn, {
-                    "status": "ok",
-                    "message": "Nothing running",
-                    "cancelled": 0,
-                })
+            req_id = request.get("request_id")
+            if "request_key" in request:
+                with ctx.store.connect() as db:
+                    row = db.execute('SELECT id FROM requests WHERE request_key=?',
+                                     (request["request_key"],)).fetchone()
+                if row is None:
+                    _send_response(conn, {"status": "error", "code": "unknown_request", "cancelled": 0})
+                    return True
+                req_id = row[0]
+            if req_id is not None and (type(req_id) is not int or req_id <= 0):
+                _send_response(conn, {"status": "error", "message": "Invalid request_id"})
                 return True
-
-            # Also cancel all queued requests
-            cancelled_count = 1  # The running one
-            while not ctx.request_queue.empty():
-                try:
-                    queued = ctx.request_queue.get_nowait()
-                    queued.cancelled = True
-                    queued.result = {
-                        "status": "cancelled",
-                        "response": "",
-                        "message": "Cancelled",
-                        "wall_clock_seconds": 0,
-                        "request_id": queued.request_id,
-                    }
-                    queued.done.set()
-                    cancelled_count += 1
-                except queue.Empty:
-                    break
-
-            _send_response(conn, {
-                "status": "ok",
-                "request_id": running_id,
-                "cancelled": cancelled_count,
-            })
+            _send_response(conn, _cancel_requests(ctx, req_id, request.get("attempt_id")))
             return True
 
         if action == "queue":
@@ -490,22 +540,13 @@ def _handle_connection(
 
         if action == "result":
             req_id = request.get("request_id")
-            if req_id is None:
-                _send_response(conn, {"status": "error", "message": "Missing request_id"})
+            if type(req_id) is not int or req_id <= 0:
+                _send_response(conn, {"status": "error", "message": "Invalid request_id"})
                 return True
-            with ctx.lock:
-                stored = ctx.completed_results.get(int(req_id))
-                # Check if it's the currently running request
-                is_running = (
-                    ctx.current_request is not None
-                    and ctx.current_request.request_id == int(req_id)
-                )
-            if stored is not None:
-                _send_response(conn, stored)
-            elif is_running:
-                _send_response(conn, {"status": "pending", "message": "Request still running"})
-            else:
-                _send_response(conn, {"status": "error", "message": "Request {} not found".format(req_id)})
+            stored = ctx.store.get(req_id)
+            _send_response(conn, result_receipt(stored) if stored else {
+                "status": "error", "code": "unknown_request", "request_id": req_id,
+                "message": "Request {} not found".format(req_id)})
             return True
 
         _send_response(conn, {"status": "error", "message": "Unknown action: {}".format(action)})
@@ -535,6 +576,15 @@ def _connection_handler(
 
 
 def run_daemon(repo_root: str, name: str) -> None:
+    from .locking import daemon_lock
+    with daemon_lock(session_dir(repo_root, name) / "daemon.lock") as acquired:
+        if not acquired:
+            logging.error("Session daemon already owns %s", name)
+            return
+        _serve_daemon(repo_root, name)
+
+
+def _serve_daemon(repo_root: str, name: str) -> None:
     """Main daemon loop — listen on unix socket, handle requests.
 
     Uses a worker thread for serial prompt execution and handler threads
@@ -549,6 +599,13 @@ def run_daemon(repo_root: str, name: str) -> None:
     # Clean up stale socket
     if os.path.exists(sock_path):
         os.unlink(sock_path)
+
+    ctx = _DaemonContext()
+    ctx.store = RequestStore(repo_root, name)
+    for request_id, payload in ctx.store.recover():
+        req = _QueuedRequest(request_id=request_id, prompt=payload["prompt"], options=payload)
+        ctx.requests[request_id] = req
+        ctx.request_queue.put_nowait(req)
 
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
@@ -565,16 +622,17 @@ def run_daemon(repo_root: str, name: str) -> None:
     server.settimeout(1.0)
 
     # Update state with PID — only after successful bind
+    import uuid
+    state.daemon_id = uuid.uuid4().hex
     state.pid = os.getpid()
     state.status = "active"
     save_state(repo_root, state)
-
-    ctx = _DaemonContext()
 
     # Start worker thread
     worker = threading.Thread(
         target=_worker_loop, args=(ctx, state, repo_root), daemon=True,
     )
+    ctx.worker = worker
     worker.start()
 
     def _sigterm_handler(signum: int, frame: Any) -> None:
@@ -607,23 +665,7 @@ def run_daemon(repo_root: str, name: str) -> None:
     finally:
         ctx.running = False
 
-        # Drain queue so worker can exit
-        while not ctx.request_queue.empty():
-            try:
-                req = ctx.request_queue.get_nowait()
-                req.cancelled = True
-                req.result = {
-                    "status": "cancelled",
-                    "response": "",
-                    "message": "Daemon shutting down",
-                    "wall_clock_seconds": 0,
-                }
-                req.done.set()
-            except queue.Empty:
-                break
-
-        # Cancel current request
-        ctx.cancel_event.set()
+        _cancel_requests(ctx)
 
         # Wait for handler threads (they'll unblock once queued requests resolve)
         for ht in handler_threads:
@@ -633,6 +675,7 @@ def run_daemon(repo_root: str, name: str) -> None:
         server.close()
         if os.path.exists(sock_path):
             os.unlink(sock_path)
-        state.status = "stopped"
-        state.pid = None
+        state.status = "unknown" if worker.is_alive() else "stopped"
+        if not worker.is_alive():
+            state.pid = None
         save_state(repo_root, state)

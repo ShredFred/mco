@@ -1,0 +1,9 @@
+duplicate submit: {'status': 'queued', 'request_id': 1, 'position': 1} {'status': 'queued', 'request_id': 2, 'position': 2}
+queued lookup: {'status': 'error', 'message': 'Request 1 not found'}
+cancel while queued only: {'status': 'ok', 'message': 'Nothing running', 'cancelled': 0} remaining= 2
+restart counters: 3 1
+cancel with running: {'status': 'ok', 'request_id': 99, 'cancelled': 3}
+drained cancelled lookup: {'status': 'error', 'message': 'Request 1 not found'}
+worker exception escapes: injected adapter failure done= False current= 1
+unverified PID status: active
+fallback signal without identity: call(123456, 15)

@@ -102,6 +102,7 @@ class TestDispatchWithRetry(unittest.TestCase):
                 # Second attempt: success
                 status.completed = True
                 status.attempt_state = "SUCCEEDED"
+                status.exit_code = 0
             return status
 
         mock_adapter.run.side_effect = fake_run
@@ -199,6 +200,7 @@ class TestDispatchWithRetry(unittest.TestCase):
             status = MagicMock()
             status.completed = True
             status.attempt_state = "SUCCEEDED"
+            status.exit_code = 0
             return status
 
         mock_adapter.run.side_effect = fake_run

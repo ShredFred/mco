@@ -1,0 +1,30 @@
+{
+  "python": {
+    "command": "/tmp/mco-hardening-venv/bin/python -m unittest discover -s tests",
+    "result": "Ran 504 tests in 89.098s; OK (skipped=2)"
+  },
+  "node": {
+    "command": "npm test",
+    "result": "25 tests; pass 24, fail 0, skipped 1 (Windows cmd shim)"
+  },
+  "mcp": {
+    "command": "/tmp/mco-hardening-venv/bin/python -m unittest tests.test_mcp_server",
+    "result": "Ran 17 tests; OK, including registered schema/stdio checks"
+  },
+  "packaging": {
+    "command": "PATH=/tmp/mco-hardening-venv/bin:$PATH MCO_PYTHON=/tmp/mco-hardening-venv/bin/python bash scripts/run_npm_packaging_smoke.sh",
+    "result": "npm packaging smoke: PASS"
+  },
+  "skill": {
+    "command": "python scripts/check_skill_format.py skills/mco-cli",
+    "result": "PASS"
+  },
+  "version": {
+    "command": "python scripts/check_package_version.py",
+    "result": "PASS (0.12.1)"
+  },
+  "diff": {
+    "command": "git diff --check",
+    "result": "exit 0"
+  }
+}

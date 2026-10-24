@@ -1,0 +1,41 @@
+HISTORICAL PRE-IMPLEMENTATION AUDIT. Follow-up changes and current verification are in HARDENING.txt. Draft acceptance lists have not all been implemented or published.
+
+MCO delegation hardening audit — 2026-10-24
+
+Outcome
+Six complete prioritized issue drafts are in issues/01.md through issues/06.md. No issue URLs exist: ShredFred/mco has issues disabled. No source implementation, commits, settings, PRs, upstream changes, provider runs, or agents were created.
+
+Repository/base verification
+Workspace branch: ShredFred/delegation-hardening; HEAD fef05730d2b539eac3f08151b0ab829c6cc251aa; initially clean, no branch tracking target shown.
+origin=https://github.com/ShredFred/mco.git; upstream=https://github.com/mco-org/mco.git.
+GitHub default branch is main. git ls-remote origin refs/heads/main confirms fef0573, matching origin/main and this workspace. merge-base(HEAD, local main)=fef0573.
+Local main aa5e6c771e157f00ff0ce2ea92c467706457fa03 is nine commits ahead, checked out in another worktree. It contains the v0.12.1 upstream merge and is not the fork's current remote base. It was inspected read-only and not switched or modified.
+./mco --version=0.11.0; installed mco --version=0.12.1. Installed executable resolves through ~/.local/bin/mco to the node-v24.14.1 global package @tt-a1i/mco. Its launcher runs the package-local Python entry point, not this checkout. Installed session/{daemon,client,manager,state}.py are byte-identical to workspace; local main also has no session-module differences.
+Newer local main has MCP progress, configured policy/model/timeouts, Windows process support, and invocation timeout fixes. These are not new backlog gaps. Before implementation explicitly select/rebase onto the intended fork base; do not assume the installed binary tests this checkout.
+
+Verified existing capabilities
+- Persisted session summary and conversation history, detached daemon, ensure and history-preserving resume (runtime/session/{state,manager}.py).
+- Serial bounded queue with concurrent socket handlers, queued acknowledgements, running-result lookup and last-50 completed result cache; nowait exists (daemon.py, client.py).
+- Classified retry/backoff, cancellation checks and partial output preservation (daemon.py; tests/test_session_retry.py).
+- Provider process-group cancellation and exit classification exist (adapters/shim.py); invocation runtime has per-invocation/global deadlines, cancellation, transport decoding, partial results, streaming and optional durable artifacts.
+- Read/write/yolo provider mappings and path validation exist. External worktrees can be supplied as repo roots; lack of automatic worktree creation is not a defect.
+- Deterministic fake adapters already exist in tests/test_invocation_runtime.py. Fault injection belongs in each vertical slice, not a new testing platform.
+- CLI has session lifecycle commands. MCP has doctor/run/review and raw operational output; local main adds policy/progress improvements, not session lifecycle parity.
+
+Evidence and limitations
+PYTHONPATH=. python3 audit/delegation-hardening/reproduce.py produces probe-output.txt without launching any daemon/provider/subprocess or sending a real signal. It demonstrates duplicate submissions, restart ID reset, queued result not found, queued-only cancellation no-op, cancelled result not found, worker exception escaping without completion signal, PID-only active classification and fallback signal attempt (mocked).
+These are deterministic in-process code-path probes, not end-to-end crash/restart or real provider robustness proof. Crash recovery absence follows from inspected storage paths; tests proposed in the drafts must establish future recovery behavior. Write collision and MCP disconnect outcomes require bounded investigation rather than unsupported corruption/orphan claims.
+Selected baseline: python3 -m unittest tests.test_session_state tests.test_session_retry tests.test_mcp_server tests.test_execution_modes tests.test_invocation_runtime — 95 tests, 15.909s, OK. No source changes made. This is not the full suite or real-provider coverage. Socket daemon tests were read; the selected suite uses fakes/mocks rather than live providers.
+
+GitHub blocker and duplicate check
+Explicit fork-targeted gh issue list --repo ShredFred/mco --state all --limit 200 --json number,title,body,url,state fails: "the 'ShredFred/mco' repository has disabled issues".
+gh repo view ShredFred/mco --json nameWithOwner,defaultBranchRef,url,hasIssuesEnabled confirms hasIssuesEnabled:false.
+Read-only gh api repos/ShredFred/mco/issues --method GET -f state=all -f per_page=100 returned []: no existing issue records available to duplicate-check. Re-list before publishing because the repository can change.
+This gh version does not support --repo for repo view; the positional ShredFred/mco argument explicitly targets the fork. All issue commands use --repo ShredFred/mco. No upstream issue/comment/PR action occurred. Repository issue settings were not changed.
+
+Implementation order / first task
+01 P1 durable caller identity and explicit attempts -> 02 P1 persistent lifecycle/results and worker failure boundary -> 03 P1 scoped cancellation. 04 P1 daemon/process identity can proceed independently of 01 initially; land it before safe cancellation/recovery is considered complete. Then 05 P2 external checkout ownership guard -> 06 P2 shared CLI/MCP lifecycle integration.
+First proposed implementation task: select the intended fork base, add a failing fake-backed lost-ACK/resubmit test, then implement opt-in caller request key + immutable payload fingerprint + persisted accepted receipt before ACK. Prove same-key same-payload queues once and conflicting payload never dispatches. Keep that first change confined to submission/record/client plumbing; follow with attempt/retry details in 01 before closing it. Add ticket references after publication; never invent issue numbers.
+
+Publication
+After the owner enables fork issues, recheck duplicates and publish drafts in order using gh issue create --repo ShredFred/mco --title <draft title> --body-file <draft>. Replace local draft dependency names with actual issue links and record returned URLs here. Draft priority is in each title/body; no label availability is assumed. GitHub becomes authoritative on publication; these are fallback drafts, not a second ticket system.

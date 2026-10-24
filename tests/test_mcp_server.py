@@ -87,7 +87,7 @@ class McpServerRegistrationTests(unittest.IsolatedAsyncioTestCase):
                     result = await session.list_tools()
 
         tools = {tool.name: tool for tool in result.tools}
-        self.assertEqual(set(tools), {"mco_doctor", "mco_review", "mco_run"})
+        self.assertEqual(set(tools), {"mco_doctor", "mco_review", "mco_run", "mco_session_submit", "mco_session_result", "mco_session_cancel"})
         self.assertNotIn("ctx", tools["mco_review"].inputSchema["properties"])
         self.assertNotIn("ctx", tools["mco_run"].inputSchema["properties"])
 

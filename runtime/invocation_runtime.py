@@ -16,6 +16,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 from uuid import uuid4
 
 from .artifacts import validate_task_id
+from .write_ownership import guard_workflow
 from .contracts import ProviderAdapter, TaskInput
 from .invocation_artifacts import InvocationArtifactWriter
 
@@ -704,6 +705,7 @@ def _supports_context_files(adapter: ProviderAdapter) -> bool:
     return isinstance(keys, list) and "context_files" in keys
 
 
+@guard_workflow
 def run_invocation_workflow(
     *,
     invocations: Sequence[AgentInvocation],
@@ -730,6 +732,8 @@ def run_invocation_workflow(
     poll_interval_seconds: float = 0.05,
     include_token_usage: bool = False,
     invocation_prompts: Optional[Mapping[str, str]] = None,
+    write_owner: str = "",
+    ticket_ref: str = "",
 ) -> dict[str, object]:
     if not chain and not debate and not synthesize:
         return run_invocations(

@@ -14,6 +14,8 @@ dist/
 
 # Local runtime state
 .mco/state.json
+.mco/sessions/
+.mco/write-ownership.sqlite3*
 
 # Hive workspace / local mcporter config (not part of repo)
 /.hive/

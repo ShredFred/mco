@@ -9,8 +9,8 @@ from unittest.mock import patch, MagicMock
 class TestSessionSendKeyboardInterrupt(unittest.TestCase):
     @patch("runtime.session.client.send_prompt", side_effect=KeyboardInterrupt)
     @patch("runtime.session.client.cancel_session")
-    def test_keyboard_interrupt_calls_cancel(self, mock_cancel, mock_send) -> None:
-        """Ctrl+C during session send should call cancel_session."""
+    def test_keyboard_interrupt_does_not_cancel_other_requests(self, mock_cancel, mock_send) -> None:
+        """The shared client scopes Ctrl+C; CLI must not issue session-wide cancel."""
         mock_cancel.return_value = {"status": "ok", "cancelled": 1}
         from runtime.cli import _handle_session
         import argparse
@@ -25,4 +25,4 @@ class TestSessionSendKeyboardInterrupt(unittest.TestCase):
         )
         exit_code = _handle_session(args)
         self.assertEqual(exit_code, 130)
-        mock_cancel.assert_called_once()
+        mock_cancel.assert_not_called()

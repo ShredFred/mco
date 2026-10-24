@@ -8,6 +8,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .locking import lifecycle_serialized
+
 from .state import (
     SessionState,
     HistoryEntry,
@@ -62,10 +64,14 @@ def _is_pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
         return True
-    except (OSError, ProcessLookupError):
+    except PermissionError:
+        # The process may be alive; callers must verify daemon ownership separately.
+        return True
+    except OSError:
         return False
 
 
+@lifecycle_serialized
 def start_session(
     provider: str,
     repo_root: str = ".",
@@ -81,9 +87,9 @@ def start_session(
 
     repo_root = str(Path(repo_root).resolve())
 
-    # Check if session already exists and is active
+    # A live or unverified incarnation must not have its identity overwritten.
     existing = load_state(repo_root, name)
-    if existing is not None and existing.status == "active":
+    if existing is not None:
         if existing.pid and _is_pid_alive(existing.pid):
             raise ValueError("Session '{}' is already active (pid={})".format(name, existing.pid))
 
@@ -100,19 +106,18 @@ def start_session(
     _launch_daemon(repo_root, name)
 
     # Wait for socket to appear (daemon writes it on successful bind)
-    sock_path = session_dir(repo_root, name) / "sock"
     for _ in range(100):  # 5 seconds
-        if sock_path.exists():
+        candidate = load_state(repo_root, name)
+        if candidate and _verified_daemon(repo_root, candidate):
             break
         time.sleep(0.05)
 
     # Verify daemon actually started
     state = load_state(repo_root, name)
-    if state is None or not state.pid or not _is_pid_alive(state.pid):
+    if state is None or not _verified_daemon(repo_root, state):
         # Daemon failed to start
         if state:
-            state.status = "crashed"
-            state.pid = None
+            state.status = "unknown" if state.pid else "crashed"
             save_state(repo_root, state)
         raise ValueError(
             "Session '{}' daemon failed to start. Check .mco/sessions/{}/agent.stderr.log".format(name, name)
@@ -121,31 +126,41 @@ def start_session(
     return state
 
 
+def _verified_daemon(repo_root: str, state: SessionState) -> bool:
+    from .client import _send_request, _socket_path
+    if not state.daemon_id or not state.pid:
+        return False
+    try:
+        reply = _send_request(_socket_path(repo_root, state.name), {"action": "ping"}, timeout=0.5)
+        return (reply.get("status") == "pong" and reply.get("daemon_id") == state.daemon_id
+                and reply.get("pid") == state.pid)
+    except (OSError, ValueError):
+        return False
+
+
 def stop_session(repo_root: str, name: str) -> bool:
-    """Stop a session by sending shutdown to daemon. Returns True if stopped."""
+    """Only stop the daemon that proves ownership; never signal a stored PID."""
     from .client import stop_session as client_stop
-    result = client_stop(repo_root, name)
-    if result.get("status") == "shutdown_ack":
-        return True
-
-    # If socket is gone, try SIGTERM on PID
     state = load_state(repo_root, name)
-    if state and state.pid and _is_pid_alive(state.pid):
-        try:
-            os.kill(state.pid, 15)  # SIGTERM
-        except (OSError, ProcessLookupError):
-            pass
-        state.status = "stopped"
-        state.pid = None
-        save_state(repo_root, state)
+    if state is None:
         return True
-
-    # Already stopped
-    if state:
-        state.status = "stopped"
-        state.pid = None
-        save_state(repo_root, state)
-    return True
+    if not _verified_daemon(repo_root, state):
+        if not state.pid or not _is_pid_alive(state.pid):
+            state.status = "stopped"
+            state.pid = None
+            save_state(repo_root, state)
+            return True
+        return False
+    result = client_stop(repo_root, name, daemon_id=state.daemon_id)
+    if result.get("status") != "shutdown_ack":
+        return False
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        current = load_state(repo_root, name)
+        if current and current.daemon_id == state.daemon_id and current.status == "stopped":
+            return True
+        time.sleep(0.05)
+    return False
 
 
 def list_sessions(repo_root: str) -> List[Dict[str, Any]]:
@@ -158,12 +173,8 @@ def list_sessions(repo_root: str) -> List[Dict[str, Any]]:
     for s in sessions:
         alive = bool(s.pid and _is_pid_alive(s.pid))
         actual_status = s.status
-        if s.status == "active" and not alive:
-            actual_status = "crashed"
-            # Update on disk
-            s.status = "crashed"
-            s.pid = None
-            save_state(repo_root, s)
+        if s.status == "active":
+            actual_status = "active" if alive and _verified_daemon(repo_root, s) else ("unknown" if alive else "crashed")
         result.append({
             "name": s.name,
             "provider": s.provider,
@@ -193,6 +204,8 @@ def ensure_session(
     existing = load_state(repo_root, name)
 
     if existing is not None:
+        if existing.provider != provider:
+            raise ValueError("Session provider mismatch: {} != {}".format(existing.provider, provider))
         if existing.status == "active" and existing.pid and _is_pid_alive(existing.pid):
             if existing.provider != provider:
                 raise ValueError(
@@ -200,6 +213,8 @@ def ensure_session(
                         name, existing.provider, provider,
                     )
                 )
+            if not _verified_daemon(repo_root, existing):
+                raise ValueError("Session '{}' has unverified daemon identity; reconcile before reuse".format(name))
             return existing
         # Stopped or crashed — resume
         if existing.provider == provider:
@@ -209,6 +224,7 @@ def ensure_session(
     return start_session(provider, repo_root=repo_root, name=name)
 
 
+@lifecycle_serialized
 def resume_session(repo_root: str, name: str, provider: Optional[str] = None) -> SessionState:
     """Resume a stopped or crashed session.
 
@@ -227,7 +243,9 @@ def resume_session(repo_root: str, name: str, provider: Optional[str] = None) ->
             )
         )
 
-    if state.status == "active" and state.pid and _is_pid_alive(state.pid):
+    if state.pid and _is_pid_alive(state.pid):
+        if not _verified_daemon(repo_root, state):
+            raise ValueError("Session '{}' has unverified daemon identity; reconcile before resume".format(name))
         return state  # Already running
 
     # Mark as active and restart daemon
@@ -237,17 +255,16 @@ def resume_session(repo_root: str, name: str, provider: Optional[str] = None) ->
     _launch_daemon(repo_root, name)
 
     # Wait for socket
-    sock_path = session_dir(repo_root, name) / "sock"
     for _ in range(100):
-        if sock_path.exists():
+        candidate = load_state(repo_root, name)
+        if candidate and _verified_daemon(repo_root, candidate):
             break
         time.sleep(0.05)
 
     state = load_state(repo_root, name)
-    if state is None or not state.pid or not _is_pid_alive(state.pid):
+    if state is None or not _verified_daemon(repo_root, state):
         if state:
-            state.status = "crashed"
-            state.pid = None
+            state.status = "unknown" if state.pid else "crashed"
             save_state(repo_root, state)
         raise ValueError("Session '{}' daemon failed to resume".format(name))
 

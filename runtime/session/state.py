@@ -31,6 +31,7 @@ class SessionState:
     last_active: str = ""
     repo_root: str = "."
     turn_count: int = 0
+    daemon_id: str = ""
 
     def __post_init__(self) -> None:
         if not self.created_at:
@@ -89,7 +90,17 @@ def save_state(repo_root: str, state: SessionState) -> Path:
     d = session_dir(repo_root, state.name)
     d.mkdir(parents=True, exist_ok=True)
     path = d / "state.json"
-    path.write_text(json.dumps(asdict(state), indent=2), encoding="utf-8")
+    import tempfile
+    fd, temporary = tempfile.mkstemp(prefix="state-", dir=str(d))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(asdict(state), indent=2))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
     return path
 
 

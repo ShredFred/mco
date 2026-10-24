@@ -234,6 +234,19 @@ class TestBroaderExceptionHandling(unittest.TestCase):
                 break
             time.sleep(0.05)
 
+        first = _send_raw(sock_path, {"action": "send", "prompt": "trigger failure", "nowait": True})
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            outcome = get_result(tmp, "test-exc", first["request_id"])
+            if outcome.get("status") != "pending":
+                break
+            time.sleep(0.02)
+        self.assertEqual(outcome["status"], "unknown")
+        from runtime.session.client import send_prompt
+        second = send_prompt(tmp, "test-exc", "worker still works")
+        self.assertEqual(second["response"], "second call ok")
+        self.assertEqual(call_count["n"], 2)
+
         # Daemon should still accept pings
         ping = _send_raw(sock_path, {"action": "ping"})
         self.assertEqual(ping["status"], "pong")

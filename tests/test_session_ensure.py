@@ -21,7 +21,8 @@ class TestEnsureSession(unittest.TestCase):
 
     @patch("runtime.session.manager._is_pid_alive", return_value=True)
     @patch("runtime.session.manager._launch_daemon")
-    def test_ensure_creates_new_session(self, mock_launch, mock_alive) -> None:
+    @patch("runtime.session.manager._verified_daemon", return_value=True)
+    def test_ensure_creates_new_session(self, mock_verified, mock_launch, mock_alive) -> None:
         # Simulate daemon writing state with pid after launch
         from runtime.session.state import session_dir
         def _fake_launch(repo_root, name):
@@ -39,7 +40,8 @@ class TestEnsureSession(unittest.TestCase):
 
     @patch("runtime.session.manager._launch_daemon")
     @patch("runtime.session.manager._is_pid_alive", return_value=True)
-    def test_ensure_returns_existing_active(self, mock_alive, mock_launch) -> None:
+    @patch("runtime.session.manager._verified_daemon", return_value=True)
+    def test_ensure_returns_existing_active(self, mock_verified, mock_alive, mock_launch) -> None:
         existing = SessionState(name="test-ensure", provider="claude", pid=99999, status="active", repo_root=self.tmp)
         save_state(self.tmp, existing)
         state = ensure_session("claude", repo_root=self.tmp, name="test-ensure")
