@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
-const { spawnSync } = require("node:child_process");
 const { resolve } = require("node:path");
+const { spawnExecutable } = require("../scripts/exec-util.js");
 
 function isCompatiblePython(command, runner, env) {
   const result = runner(
@@ -13,7 +13,7 @@ function isCompatiblePython(command, runner, env) {
 }
 
 function resolvePython(deps = {}) {
-  const runner = deps.runner || spawnSync;
+  const runner = deps.runner || spawnExecutable;
   const env = deps.env || process.env;
   const candidates = [
     env.MCO_PYTHON,
@@ -75,7 +75,7 @@ function launch(args, deps = {}) {
   }
 
   const scriptPath = resolve(__dirname, "..", "mco");
-  const runner = deps.runner || spawnSync;
+  const runner = deps.runner || spawnExecutable;
   const python = deps.python || resolvePython(deps);
   if (!python) {
     console.error("MCO requires Python 3.10 or newer. Install it or set MCO_PYTHON.");

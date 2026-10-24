@@ -50,6 +50,17 @@ class ReviewConfig:
 _DEFAULT_GLOBAL_CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".mco")
 
 
+def resolve_global_config_dir() -> str:
+    """Resolve the global config directory, honouring MCO_CONFIG_DIR.
+
+    Resolved per call rather than at import so tests and CI can point the
+    broker at an isolated directory instead of silently inheriting whatever
+    lives in the current user's home.
+    """
+    override = os.environ.get("MCO_CONFIG_DIR", "").strip()
+    return override or _DEFAULT_GLOBAL_CONFIG_DIR
+
+
 def _warn(message: str) -> None:
     print(f"[mco] warning: {message}", file=sys.stderr)
 
@@ -278,7 +289,7 @@ def load_agent_registrations(
     repo_root: str,
     global_config_dir: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    global_dir = global_config_dir or _DEFAULT_GLOBAL_CONFIG_DIR
+    global_dir = global_config_dir or resolve_global_config_dir()
     candidates = [
         (os.path.join(repo_root, ".mco", "agents.yaml"), "agents"),
         (os.path.join(repo_root, ".mcorc.yaml"), "config"),
@@ -322,7 +333,7 @@ def load_config_files(
     Merge order: global < project. Nested dicts (e.g. policy) are deep-merged.
     Returns empty dict if no config files found.
     """
-    global_dir = global_config_dir or _DEFAULT_GLOBAL_CONFIG_DIR
+    global_dir = global_config_dir or resolve_global_config_dir()
     merged: Dict[str, Any] = {}
 
     # Global JSON config

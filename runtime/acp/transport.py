@@ -12,6 +12,8 @@ import subprocess
 import threading
 from typing import Any, Dict, List, Optional
 
+from ..platform import kill_process, prepare_spawn, terminate_process
+
 
 class JsonRpcError(Exception):
     """Error response from the JSON-RPC peer."""
@@ -50,6 +52,7 @@ class JsonRpcTransport:
         self._reader_thread: Optional[threading.Thread] = None
         self._running = False
         self._stderr_path: Optional[str] = None
+        self._owns_process_group = False
 
     @property
     def pid(self) -> Optional[int]:
@@ -75,17 +78,20 @@ class JsonRpcTransport:
             self._stderr_path = stderr_path
             stderr_file = open(stderr_path, "w", encoding="utf-8")
 
+        process_env = env or os.environ.copy()
+        spawn_args, spawn_options = prepare_spawn(command, process_env)
         try:
             self._process = subprocess.Popen(
-                command,
+                spawn_args,
                 cwd=cwd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=stderr_file or subprocess.DEVNULL,
                 text=True,
-                start_new_session=True,
-                env=env or os.environ.copy(),
+                env=process_env,
+                **spawn_options,
             )
+            self._owns_process_group = True
         except Exception:
             if stderr_file:
                 stderr_file.close()
@@ -257,6 +263,25 @@ class JsonRpcTransport:
                     self._process.stdin.close()
             except OSError:
                 pass
+            if self._process.poll() is None:
+                try:
+                    if self._owns_process_group:
+                        terminate_process(self._process)
+                    else:
+                        self._process.terminate()
+                except (ProcessLookupError, OSError):
+                    pass
+            try:
+                self._process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    if self._owns_process_group:
+                        kill_process(self._process)
+                    else:
+                        self._process.kill()
+                    self._process.wait(timeout=2)
+                except (ProcessLookupError, OSError):
+                    pass
             try:
                 if self._process.stdout:
                     self._process.stdout.close()
@@ -267,16 +292,8 @@ class JsonRpcTransport:
                     self._process.stderr.close()
             except (OSError, ValueError):
                 pass
-            try:
-                self._process.terminate()
-                self._process.wait(timeout=5)
-            except (subprocess.TimeoutExpired, OSError):
-                try:
-                    self._process.kill()
-                    self._process.wait(timeout=2)
-                except OSError:
-                    pass
             self._process = None
+            self._owns_process_group = False
         # Wake pending requests
         with self._pending_lock:
             for event in list(self._pending.values()):

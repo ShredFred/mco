@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import json
+import logging
 import queue
 import shutil
 import tempfile
@@ -24,6 +25,8 @@ COMPLETE_EXIT_CODE = 0
 PARTIAL_EXIT_CODE = 1
 FAILED_EXIT_CODE = 2
 _EVENT_CALLBACK_LOCK = threading.RLock()
+# Warn at most once per process; a failing consumer usually fails on every event.
+_EVENT_CALLBACK_WARNED: set[bool] = set()
 
 
 def _run_adapter_with_deadline(
@@ -83,8 +86,14 @@ def _notify(event_callback: Optional[Callable[[dict[str, object]], None]], event
     try:
         with _EVENT_CALLBACK_LOCK:
             event_callback(event)
-    except Exception:
-        pass
+    except Exception as exc:
+        # A broken consumer must never take a provider run down, but silence
+        # here can cost a whole answer: a console encoding error swallowed
+        # every delta while the run still reported success. Warn once so a
+        # dropped event is diagnosable instead of invisible.
+        if not _EVENT_CALLBACK_WARNED:
+            _EVENT_CALLBACK_WARNED.add(True)
+            logging.warning("event callback failed, streamed output was dropped: %s", exc)
 
 
 @dataclass(frozen=True)
@@ -465,7 +474,7 @@ def run_invocations(
             shutil.rmtree(artifact_root_path)
         artifact_root_path.mkdir(parents=True, exist_ok=True)
     else:
-        temp_directory = tempfile.TemporaryDirectory(prefix="mco-invocations-")
+        temp_directory = tempfile.TemporaryDirectory(prefix="mco-invocations-", ignore_cleanup_errors=True)
         artifact_root_path = Path(temp_directory.name)
     provider_artifact_base = artifact_root_path / "provider-runs"
     provider_artifact_base.mkdir(parents=True, exist_ok=True)
@@ -531,7 +540,12 @@ def run_invocations(
             while pending:
                 wait_timeout = 0.05
                 if deadline is not None:
-                    wait_timeout = min(wait_timeout, max(0.0, deadline - time.monotonic()))
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        stop_state["reason"] = "timeout"
+                        stop_event.set()
+                    else:
+                        wait_timeout = min(wait_timeout, remaining)
                 done, pending = wait(pending, timeout=wait_timeout, return_when=FIRST_COMPLETED)
                 for future in done:
                     index = futures[future]
@@ -578,9 +592,6 @@ def run_invocations(
                     if "usage" in result:
                         event["usage"] = result["usage"]
                     _notify(event_callback, event)
-                if deadline is not None and pending and time.monotonic() >= deadline:
-                    stop_state["reason"] = "timeout"
-                    stop_event.set()
                 if stop_event.is_set():
                     for future in pending:
                         future.cancel()
@@ -750,7 +761,7 @@ def run_invocation_workflow(
     if persist_artifacts:
         stage_base = str(Path(artifact_base or "reports/review").resolve())
     else:
-        temp_directory = tempfile.TemporaryDirectory(prefix="mco-invocation-workflow-")
+        temp_directory = tempfile.TemporaryDirectory(prefix="mco-invocation-workflow-", ignore_cleanup_errors=True)
         stage_base = temp_directory.name
     artifact_root = (Path(stage_base).resolve() / resolved_task_id)
     if persist_artifacts and artifact_root.exists():
